@@ -2208,10 +2208,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
         # total_tokens and seq_idx are only for Mamba and should not be forwarded to TE attention.
         # tokens_per_sample is only for MoE sequence-level aux loss reshaping.
+        # The max_seqlen tensors are only for Mamba / CUDA graph buffer management.
         self.kept_packed_seq_params.discard("total_tokens")
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_scatter_cache")
+        self.kept_packed_seq_params.discard("max_seqlen_q_tensor")
+        self.kept_packed_seq_params.discard("max_seqlen_kv_tensor")
 
         if get_te_version() < PkgVersion("2.2.0"):
             self.kept_packed_seq_params.discard("pad_between_seqs")

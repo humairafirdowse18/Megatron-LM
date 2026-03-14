@@ -2064,6 +2064,13 @@ def _add_inference_args(parser):
                        'it is transformed to an empty list in validate_args. The deprecated values '
                        '"full_iteration" and "full_iteration_inference" are also accepted and migrated '
                        'to the new API in validate_args.')
+    group.add_argument('--cuda-graph-max-packed-seqs', type=int, default=None,
+                       help='Maximum number of packed sequences per micro-batch for CUDA graph '
+                       'capture. cu_seqlens tensors are padded to this size+1 for fixed-shape '
+                       'graph inputs. Smaller values improve flash_attn_varlen performance '
+                       '(fewer zero-length sequence entries). Default: uses CUDA_GRAPH_MAX_PACKED_SEQS '
+                       '(2048) from packed_seq_params.py. Set to the actual max sequences in your '
+                       'dataset for best performance (e.g. 64 for seq_len=32768 with typical SFT data).')
     group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
                        help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
                        dest='use_legacy_static_engine')

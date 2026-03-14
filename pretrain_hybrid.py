@@ -42,7 +42,7 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, Moc
 from megatron.core.enums import ModelType
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import CUDA_GRAPH_MAX_PACKED_SEQS, PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_hybrid_data_context_parallel_groups,
@@ -297,6 +297,7 @@ def forward_step(data_iterator, model: HybridModel):
         data_iterator : Input data iterator
         model (HybridModel): The Hybrid Model
     """
+    args = get_args()
     timers = get_timers()
 
     # Get the batch.
@@ -328,6 +329,30 @@ def forward_step(data_iterator, model: HybridModel):
         # attention only computes work for real tokens within each chunk.
         update_seqlen_stats_from_cu_seqlens(cu_seqlens)
         cu_seqlens_for_params = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
+        # Computed before CUDA graph padding, which repeats the final cumulative
+        # offset and so must not change the token total.
+        total_tokens = int(cu_seqlens_for_params[-1].item())
+
+        # In CUDA graph mode, pad cu_seqlens to a fixed size so graph inputs have
+        # constant shape. The padded entries describe zero-length sequences, so
+        # flash_attn_varlen still only computes work for the real sequences.
+        # Set --cuda-graph-max-packed-seqs to your dataset max for best CG perf.
+        if getattr(args, 'cuda_graph_impl', 'none') != 'none':
+            target_len = (
+                getattr(args, 'cuda_graph_max_packed_seqs', None) or CUDA_GRAPH_MAX_PACKED_SEQS
+            ) + 1
+            if cu_seqlens_for_params.shape[0] <= target_len:
+                cu_seqlens_for_params = PackedSeqParams.pad_cu_seqlens(
+                    cu_seqlens_for_params, target_len
+                )
+                if cu_seqlens_padded is not None:
+                    cu_seqlens_padded = PackedSeqParams.pad_cu_seqlens(
+                        cu_seqlens_padded, target_len
+                    )
+            # else: sequence count exceeds the CG bucket -> leave cu_seqlens
+            # unpadded. The layer-level fallback in _te_cuda_graph_replay detects
+            # the size mismatch and routes this batch through the non-CG path.
+
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens_for_params,
@@ -336,9 +361,11 @@ def forward_step(data_iterator, model: HybridModel):
             cu_seqlens_kv_padded=cu_seqlens_padded,
             max_seqlen_q=int(max_seqlen.item()),
             max_seqlen_kv=int(max_seqlen.item()),
+            max_seqlen_q_tensor=max_seqlen,
+            max_seqlen_kv_tensor=max_seqlen,
             local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
             cp_group=hybrid_cp_group,
-            total_tokens=int(cu_seqlens_for_params[-1].item()),
+            total_tokens=total_tokens,
             tokens_per_sample=args.seq_length,
         )
 
