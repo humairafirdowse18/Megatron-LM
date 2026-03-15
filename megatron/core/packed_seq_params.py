@@ -60,10 +60,16 @@ class PackedSeqParams:
         if self.seq_idx is not None:
             return  # Already set (e.g. CG dummy PSP with pre-allocated buffer)
 
-        cu_seqlens = (
-            self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
-        )
+        cu_seqlens = self.cu_seqlens_q
         if isinstance(cu_seqlens, Tensor) and self.total_tokens is not None:
+            # Skip seq_idx computation when cu_seqlens has been CG-padded.
+            # CG-padded cu_seqlens contain entries at the global seq_len
+            # (e.g. 262144) while total_tokens is CP-local (e.g. 8192).
+            # In CG mode, seq_idx is managed separately by mamba_layer.py's
+            # _te_cuda_graph_replay via shared CG buffers.
+            if cu_seqlens[-1] > self.total_tokens:
+                return  # CG-padded: skip, let mamba_layer handle seq_idx
+
             total_tokens_tensor = torch.tensor(
                 [self.total_tokens], dtype=cu_seqlens.dtype, device=cu_seqlens.device
             )
@@ -75,9 +81,9 @@ class PackedSeqParams:
             # appended total_tokens sentinel is smaller than cu_seqlens[-1]
             # due to padding). In either case the diff can go negative, which
             # causes torch.repeat_interleave to fail.
-            # Clamping can raise the total above total_tokens, so output_size
-            # cannot be passed here; the CUDA graph path never reaches this code
-            # because it supplies a pre-computed seq_idx and returns early above.
+            # Clamping can raise the total above total_tokens, so repeat_interleave
+            # must not be given output_size here. Both CUDA graph paths return
+            # early above, so they never depend on this branch.
             seq_lengths = seq_lengths.clamp(min=0)
             # Example: [5, 2, 4, 5] -> [0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3]
             self.seq_idx = (
