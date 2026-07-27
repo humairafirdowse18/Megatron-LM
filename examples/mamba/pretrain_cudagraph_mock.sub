@@ -1,0 +1,223 @@
+#!/bin/bash
+#SBATCH --job-name=mamba-pretrain-cudagraph-mock
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:8
+#SBATCH --exclusive
+#SBATCH --time=01:00:00
+# NOTE: --account / --partition are intentionally left out of the header so you
+# can pass them on the command line (see the sbatch example at the bottom), e.g.
+#   sbatch --account=coreai_dlalgo_nemorl --partition=batch examples/mamba/pretrain_cudagraph_mock.sub
+#
+# -----------------------------------------------------------------------------
+# Mamba/Transformer-hybrid PRETRAINING (NOT SFT) on MOCK data.
+#
+# This is the pretraining counterpart of sft_cudagraph_packedseq.sub. It drops
+# --sft (so no packed-sequence SFTDataset) and instead uses Megatron's built-in
+# --mock-data path, which generates artificial token sequences on the fly. That
+# means:
+#   * NO jsonl / blend / tokenizer files needed on disk. We use NullTokenizer
+#     + --vocab-size, so nothing on Lustre is required to smoke-test the model.
+#   * pretrain_mamba.py selects MockGPTDataset because args.sft is False and
+#     args.mock_data is True (see train_valid_test_datasets_provider()).
+#
+# CUDA graphs default OFF here (USE_CUDA_GRAPH=0). --cuda-graph-max-packed-seqs
+# is SFT/packed-only and is intentionally NOT used. Set USE_CUDA_GRAPH=1 to
+# capture graphs for the mamba+attn scopes during regular pretraining.
+#
+# Everything runs inside a pyxis/enroot container via srun, matching the cluster
+# setup used by nemo-rl/perf_runs.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ============================ Cluster / container ============================
+# Defaults mirror perf_runs/common.sh. Override any of these from the environment.
+CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/containers/megatron-lm-main-20260720/megatron_lm_mcore_ci_dev_main_20260720_14192275.sqsh}"
+# Bind-mount Lustre (ckpt/logs) and home (the repo lives here). Keep large
+# outputs OFF the 10 GB home quota -> point SAVE at Lustre.
+MOUNTS="${MOUNTS:-/lustre:/lustre,/home/humairafirdo:/home/humairafirdo}"
+REPO_ROOT="${REPO_ROOT:-/home/humairafirdo/Megatron-LM}"
+
+# ============================ Model (8B hybrid) =============================
+# Same 56-layer 8B hybrid architecture as examples/mamba/train.sh.
+TENSOR_MODEL_PARALLEL_SIZE="${TP:-4}"
+PIPELINE_MODEL_PARALLEL_SIZE="${PP:-1}"
+CONTEXT_PARALLEL_SIZE="${CP:-1}"
+HYBRID_LAYER_PATTERN="M-M-M--M-M*-M-M-M-M--M*-M-M-M-M-M*--M-M-M-M-M*-M--M-M-M-"
+HIDDEN_SIZE=4096
+NUM_ATTENTION_HEADS=32
+NUM_QUERY_GROUPS=8
+
+# ============================ Batch / sequence =============================
+SEQ_LEN="${SEQ_LEN:-8192}"
+MICRO_BATCH_SIZE="${MBS:-1}"
+GLOBAL_BATCH_SIZE="${GBS:-32}"
+
+# ============================ CUDA graphs (optional) =======================
+# OFF by default so pretraining "just works". Set USE_CUDA_GRAPH=1 to enable.
+# NOTE: --cuda-graph-max-packed-seqs is packed-SFT-only; do NOT use it here.
+USE_CUDA_GRAPH="${USE_CUDA_GRAPH:-0}"
+if [[ "${USE_CUDA_GRAPH}" == "1" ]]; then
+  CUDA_GRAPH_ARGS="--cuda-graph-impl transformer_engine --cuda-graph-scope mamba attn"
+else
+  CUDA_GRAPH_ARGS=""
+fi
+
+# ============================ Data (mock) / tokenizer ======================
+# Mock data needs a vocab size but no files. NullTokenizer + --vocab-size gives
+# a self-contained smoke test with nothing on disk.
+VOCAB_SIZE="${VOCAB_SIZE:-131072}"
+DATA_SPLIT="${DATA_SPLIT:-99,1,0}"
+
+# LOAD_DIR: Megatron-format hybrid checkpoint to resume from. EMPTY (default) =
+#            random-init, which is what you want for a perf/smoke test.
+LOAD_DIR="${LOAD_DIR:-}"
+SAVE_DIR="${SAVE_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/humairafirdo/mamba_pretrain_mock/checkpoints}"
+TENSORBOARD_DIR="${TENSORBOARD_DIR:-${SAVE_DIR}/tb}"
+DATACACHE_DIR="${DATACACHE_DIR:-${SAVE_DIR}/data-cache}"
+
+TRAIN_SAMPLES="${TRAIN_SAMPLES:-200000}"
+LR="${LR:-1e-4}"
+MIN_LR="${MIN_LR:-1e-5}"
+
+# ============================ Weights & Biases =============================
+# Logging goes to TensorBoard (${TENSORBOARD_DIR}) always. Set WANDB_PROJECT to
+# ALSO stream metrics to Weights & Biases. Leave WANDB_PROJECT empty to disable.
+#
+# Auth: set WANDB_API_KEY in your submit environment (it is forwarded into the
+#       container below). Or set WANDB_MODE=offline to log locally.
+WANDB_PROJECT="${WANDB_PROJECT:-}"
+WANDB_EXP_NAME="${WANDB_EXP_NAME:-${SLURM_JOB_NAME:-mamba-pretrain-mock}-${SLURM_JOB_ID:-local}}"
+WANDB_ENTITY="${WANDB_ENTITY:-}"
+WANDB_SAVE_DIR="${WANDB_SAVE_DIR:-${SAVE_DIR}/wandb}"
+WANDB_MODE="${WANDB_MODE:-online}"    # online | offline | disabled
+
+# Build the wandb args only when a project is set (empty otherwise).
+if [[ -n "${WANDB_PROJECT}" ]]; then
+  WANDB_ARGS="--wandb-project ${WANDB_PROJECT} \
+    --wandb-exp-name ${WANDB_EXP_NAME} \
+    --wandb-save-dir ${WANDB_SAVE_DIR}"
+  if [[ -n "${WANDB_ENTITY}" ]]; then
+    WANDB_ARGS="${WANDB_ARGS} --wandb-entity ${WANDB_ENTITY}"
+  fi
+  mkdir -p "${WANDB_SAVE_DIR}"
+else
+  WANDB_ARGS=""
+fi
+
+# ============================ torchrun rendezvous ==========================
+GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
+MASTER_ADDR="$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n1)"
+MASTER_PORT="${MASTER_PORT:-29500}"
+NNODES="${SLURM_NNODES}"
+
+# ---------------------------------------------------------------------------
+# Megatron args. --spec selects the Mamba hybrid stack. --mock-data turns on
+# artificial data generation (MockGPTDataset). No --sft.
+# ---------------------------------------------------------------------------
+options=" \
+    --mock-data \
+    --split ${DATA_SPLIT} \
+    ${CUDA_GRAPH_ARGS} \
+    --tensor-model-parallel-size ${TENSOR_MODEL_PARALLEL_SIZE} \
+    --pipeline-model-parallel-size ${PIPELINE_MODEL_PARALLEL_SIZE} \
+    --context-parallel-size ${CONTEXT_PARALLEL_SIZE} \
+    --sequence-parallel \
+    --use-distributed-optimizer \
+    --overlap-param-gather \
+    --overlap-grad-reduce \
+    --untie-embeddings-and-output-weights \
+    --init-method-std 0.02 \
+    --position-embedding-type none \
+    --hybrid-layer-pattern ${HYBRID_LAYER_PATTERN} \
+    --hidden-size ${HIDDEN_SIZE} \
+    --num-attention-heads ${NUM_ATTENTION_HEADS} \
+    --group-query-attention \
+    --num-query-groups ${NUM_QUERY_GROUPS} \
+    --seq-length ${SEQ_LEN} \
+    --max-position-embeddings ${SEQ_LEN} \
+    --micro-batch-size ${MICRO_BATCH_SIZE} \
+    --global-batch-size ${GLOBAL_BATCH_SIZE} \
+    --train-samples ${TRAIN_SAMPLES} \
+    --lr ${LR} \
+    --min-lr ${MIN_LR} \
+    --lr-decay-style cosine \
+    --weight-decay 0.1 \
+    --clip-grad 1.0 \
+    --attention-dropout 0.0 \
+    --hidden-dropout 0.0 \
+    --disable-bias-linear \
+    --normalization RMSNorm \
+    --adam-beta1 0.9 \
+    --adam-beta2 0.95 \
+    --bf16 \
+    --use-mcore-models \
+    --spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec \
+    --no-create-attention-mask-in-dataloader \
+    --data-cache-path ${DATACACHE_DIR} \
+    --tokenizer-type NullTokenizer \
+    --vocab-size ${VOCAB_SIZE} \
+    ${LOAD_DIR:+--load ${LOAD_DIR}} \
+    --save ${SAVE_DIR} \
+    --distributed-backend nccl \
+    --log-interval ${LOG_INTERVAL:-10} \
+    --save-interval ${SAVE_INTERVAL:-2000} \
+    --eval-interval ${EVAL_INTERVAL:-2000} \
+    --eval-iters ${EVAL_ITERS:-32} \
+    --tensorboard-dir ${TENSORBOARD_DIR} \
+    ${WANDB_ARGS}"
+
+mkdir -p "${SAVE_DIR}" "${TENSORBOARD_DIR}" "${DATACACHE_DIR}"
+
+# Command executed INSIDE the container on every node. The te_patches PYTHONPATH
+# hook is only needed for CUDA-graph capture; harmless to keep on the path.
+read -r -d '' CMD <<EOF || true
+set -euo pipefail
+export PYTHONPATH=${REPO_ROOT}/te_patches:${REPO_ROOT}:\${PYTHONPATH:-}
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NCCL_IB_SL=1
+export NCCL_IB_TIMEOUT=19
+export NCCL_IB_QPS_PER_CONNECTION=4
+export TRITON_CACHE_DIR=/tmp/triton-cache
+export TRITON_HOME=\${TRITON_CACHE_DIR}
+# --- Weights & Biases (only matters when --wandb-project is passed) ---
+export WANDB_MODE=${WANDB_MODE}
+export WANDB_API_KEY=${WANDB_API_KEY:-}
+cd ${REPO_ROOT}
+PYBIN=\${PYBIN:-python}
+\${PYBIN} -m torch.distributed.run \
+  --nnodes=${NNODES} \
+  --nproc_per_node=${GPUS_PER_NODE} \
+  --node_rank=\${SLURM_NODEID} \
+  --master_addr=${MASTER_ADDR} \
+  --master_port=${MASTER_PORT} \
+  pretrain_mamba.py ${options}
+EOF
+
+srun --nodes="${NNODES}" \
+     --ntasks-per-node=1 \
+     --container-image="${CONTAINER}" \
+     --container-mounts="${MOUNTS}" \
+     --container-workdir="${REPO_ROOT}" \
+     --no-container-mount-home \
+     bash -c "${CMD}"
+
+# -----------------------------------------------------------------------------
+# Submit examples
+# -----------------------------------------------------------------------------
+# Single node, 8xH100, mock-data pretraining smoke test (CUDA graphs OFF):
+#   sbatch --account=coreai_dlalgo_nemorl --partition=batch \
+#          examples/mamba/pretrain_cudagraph_mock.sub
+#
+# Short run + frequent checkpoints, streaming to Weights & Biases:
+#   export WANDB_API_KEY=xxxxxxxx
+#   sbatch --time=04:00:00 --account=coreai_dlalgo_nemorl --partition=batch \
+#          --export=ALL,WANDB_PROJECT=mamba-pretrain-mock,TRAIN_SAMPLES=3200,SAVE_INTERVAL=50 \
+#          examples/mamba/pretrain_cudagraph_mock.sub
+#
+# Turn CUDA graphs ON for the mamba+attn scopes during pretraining:
+#   sbatch --account=coreai_dlalgo_nemorl --partition=batch \
+#          --export=ALL,USE_CUDA_GRAPH=1 \
+#          examples/mamba/pretrain_cudagraph_mock.sub
+# -----------------------------------------------------------------------------

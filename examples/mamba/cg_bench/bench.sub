@@ -1,0 +1,305 @@
+#!/bin/bash
+#SBATCH --job-name=cgbench
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:8
+#SBATCH --exclusive
+#SBATCH --time=00:40:00
+#
+# -----------------------------------------------------------------------------
+# CUDA-graph latency benchmark for Mamba/Transformer-hybrid models.
+#
+# One job = one (MODEL_SCALE, USE_CUDA_GRAPH) point. sweep.sh submits the matrix
+# and analyze.py turns the logs into a comparison table.
+#
+# Runs on --mock-data so no dataset, tokenizer or checkpoint is needed: the only
+# thing being measured is per-step latency, and mock data keeps the input
+# pipeline out of the measurement.
+#
+# The step-count dimension does NOT need separate jobs. Megatron logs
+# "elapsed time per iteration (ms)" once per --log-interval, so a single run of
+# ITERS steps contains the whole curve; analyze.py integrates it to get
+# cumulative time vs step count and finds the CUDA-graph break-even point.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ============================ Cluster / container ============================
+CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/containers/megatron-lm-main-20260720/megatron_lm_mcore_ci_dev_main_20260720_14192275.sqsh}"
+MOUNTS="${MOUNTS:-/lustre:/lustre,/home/humairafirdo:/home/humairafirdo}"
+REPO_ROOT="${REPO_ROOT:-/home/humairafirdo/Megatron-LM}"
+
+# ============================ Benchmark axes ================================
+# MODEL_SCALE selects the architecture. 800M/2B/8B are real size steps; 8B-tp8
+# is the same 8B model at higher tensor parallelism, which shrinks each GPU's
+# kernels and so isolates the launch-bound effect from the model-size effect.
+MODEL_SCALE="${MODEL_SCALE:-8B}"
+USE_CUDA_GRAPH="${USE_CUDA_GRAPH:-0}"
+ITERS="${ITERS:-120}"
+SEQ_LEN="${SEQ_LEN:-4096}"
+MICRO_BATCH_SIZE="${MBS:-1}"
+GLOBAL_BATCH_SIZE="${GBS:-8}"
+LR="${LR:-1e-4}"
+MIN_LR="${MIN_LR:-1e-5}"
+# PACKED_SFT=1 switches from launch-overhead isolation on MockGPTDataset to the
+# branch's real variable-length SFT path. Keep the modes in separate BENCH_ROOTs
+# when comparing results.
+PACKED_SFT="${PACKED_SFT:-0}"
+CUDA_GRAPH_MAX_PACKED_SEQS="${MAX_SEQS:-64}"
+SFT_DATA_PATH="${SFT_DATA_PATH:-/lustre/fsw/portfolios/coreai/users/pmannan/nemotron_ultra_sft_data/blend_jan21.shuf.packed.10k}"
+TOKENIZER_MODEL="${TOKENIZER_MODEL:-/lustre/fsw/portfolios/coreai/users/pmannan/nemotron_ultra_sft_data/tokenizer}"
+SFT_PROMPT_FORMAT="${SFT_PROMPT_FORMAT:-identity}"
+# Log every iteration so the amortization curve has full resolution.
+LOG_INTERVAL="${LOG_INTERVAL:-1}"
+
+case "${MODEL_SCALE}" in
+  800M)
+    HYBRID_LAYER_PATTERN="M-M-M--M-*M-M-M-M--*M-M-M-M-*M--M-M-M-*M-M--M-M-"
+    HIDDEN_SIZE=1024; NUM_ATTENTION_HEADS=16; NUM_QUERY_GROUPS=8
+    FFN_HIDDEN_SIZE=""; TP_DEFAULT=1
+    ;;
+  2B)
+    HYBRID_LAYER_PATTERN="M-M-M-M*-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-"
+    HIDDEN_SIZE=2048; NUM_ATTENTION_HEADS=16; NUM_QUERY_GROUPS=8
+    FFN_HIDDEN_SIZE=11264; TP_DEFAULT=1
+    ;;
+  8B)
+    HYBRID_LAYER_PATTERN="M-M-M--M-M*-M-M-M-M--M*-M-M-M-M-M*--M-M-M-M-M*-M--M-M-M-"
+    HIDDEN_SIZE=4096; NUM_ATTENTION_HEADS=32; NUM_QUERY_GROUPS=8
+    FFN_HIDDEN_SIZE=""; TP_DEFAULT=4
+    ;;
+  8B-tp8)
+    HYBRID_LAYER_PATTERN="M-M-M--M-M*-M-M-M-M--M*-M-M-M-M-M*--M-M-M-M-M*-M--M-M-M-"
+    HIDDEN_SIZE=4096; NUM_ATTENTION_HEADS=32; NUM_QUERY_GROUPS=8
+    FFN_HIDDEN_SIZE=""; TP_DEFAULT=8
+    ;;
+  *)
+    echo "[ERROR] Unknown MODEL_SCALE '${MODEL_SCALE}' (want 800M|2B|8B|8B-tp8)" >&2
+    exit 1
+    ;;
+esac
+
+TENSOR_MODEL_PARALLEL_SIZE="${TP:-${TP_DEFAULT}}"
+PIPELINE_MODEL_PARALLEL_SIZE="${PP:-1}"
+CONTEXT_PARALLEL_SIZE="${CP:-1}"
+
+if [[ "${USE_CUDA_GRAPH}" == "1" ]]; then
+  CUDA_GRAPH_ARGS="--cuda-graph-impl transformer_engine --cuda-graph-scope mamba attn"
+  CG_TAG="cgon"
+else
+  CUDA_GRAPH_ARGS=""
+  CG_TAG="cgoff"
+fi
+
+if [[ "${PACKED_SFT}" == "1" ]]; then
+  if [[ "${MICRO_BATCH_SIZE}" != "1" ]]; then
+    echo "[ERROR] Packed SFT requires MBS=1 (got ${MICRO_BATCH_SIZE})." >&2
+    exit 2
+  fi
+  if [[ ! -r "${SFT_DATA_PATH}" ]]; then
+    echo "[ERROR] SFT_DATA_PATH is not readable: ${SFT_DATA_PATH}" >&2
+    exit 2
+  fi
+  if [[ ! -d "${TOKENIZER_MODEL}" ]]; then
+    echo "[ERROR] TOKENIZER_MODEL is not a directory: ${TOKENIZER_MODEL}" >&2
+    exit 2
+  fi
+  DATA_ARGS="--sft \
+    --sft-tokenizer-prompt-format ${SFT_PROMPT_FORMAT} \
+    --cuda-graph-max-packed-seqs ${CUDA_GRAPH_MAX_PACKED_SEQS} \
+    --data-path ${SFT_DATA_PATH} \
+    --split 100,0,0 \
+    --tokenizer-type SFTTokenizer \
+    --tokenizer-model ${TOKENIZER_MODEL}"
+  DATA_TAG="packed"
+  BUCKET_TAG="_max${CUDA_GRAPH_MAX_PACKED_SEQS}"
+else
+  DATA_ARGS="--mock-data \
+    --split 100,0,0 \
+    --tokenizer-type NullTokenizer \
+    --vocab-size ${VOCAB_SIZE:-131072}"
+  DATA_TAG="mock"
+  BUCKET_TAG=""
+fi
+
+# ============================ Output layout =================================
+# Every run gets its own directory holding the raw stdout, a manifest of the
+# axes it was run at, and TensorBoard scalars. analyze.py globs over these.
+BENCH_ROOT="${BENCH_ROOT:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/humairafirdo/cg_bench}"
+if [[ "${BENCH_ROOT}" == *"..."* ]]; then
+  echo "[ERROR] BENCH_ROOT contains the literal placeholder '...': ${BENCH_ROOT}" >&2
+  echo "[ERROR] Pass a complete writable path, for example:" >&2
+  echo "[ERROR]   /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/humairafirdo/cg_bench" >&2
+  exit 2
+fi
+RUN_TAG="${DATA_TAG}_${MODEL_SCALE}_tp${TENSOR_MODEL_PARALLEL_SIZE}_${CG_TAG}${BUCKET_TAG}_s${SEQ_LEN}_gbs${GLOBAL_BATCH_SIZE}"
+RUN_DIR="${BENCH_ROOT}/${RUN_TAG}"
+TENSORBOARD_DIR="${RUN_DIR}/tb"
+DATACACHE_DIR="${RUN_DIR}/data-cache"
+if ! mkdir -p "${RUN_DIR}" "${TENSORBOARD_DIR}" "${DATACACHE_DIR}"; then
+  echo "[ERROR] Cannot create benchmark output directory: ${RUN_DIR}" >&2
+  exit 2
+fi
+
+# ============================ nsys (opt-in) =================================
+# NSYS=1 wraps torchrun in Nsight Systems and captures a few steady-state steps.
+# This is what turns "CG is faster" into "CG removed N kernel launches worth
+# X ms of CPU time", via the cudaLaunchKernel counts in the resulting trace.
+NSYS="${NSYS:-0}"
+NSYS_START="${NSYS_START:-60}"
+NSYS_END="${NSYS_END:-65}"
+# Node mode is required for comparable graph-off/on GPU kernel counts and
+# inter-kernel gaps. Whole-graph mode intentionally omits replayed node events.
+NSYS_GRAPH_TRACE="${NSYS_GRAPH_TRACE:-node}"
+if [[ "${NSYS}" == "1" ]]; then
+  PROFILE_ARGS="--profile --profile-step-start ${NSYS_START} --profile-step-end ${NSYS_END} --profile-ranks 0"
+else
+  PROFILE_ARGS=""
+fi
+
+GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
+MASTER_ADDR="$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n1)"
+MASTER_PORT="${MASTER_PORT:-29500}"
+NNODES="${SLURM_NNODES}"
+
+# Record exactly what this data point was, so the analyzer never has to guess.
+cat > "${RUN_DIR}/manifest.json" <<JSON
+{
+  "run_tag": "${RUN_TAG}",
+  "data_mode": "${DATA_TAG}",
+  "model_scale": "${MODEL_SCALE}",
+  "use_cuda_graph": ${USE_CUDA_GRAPH},
+  "cuda_graph_max_packed_seqs": ${CUDA_GRAPH_MAX_PACKED_SEQS},
+  "hidden_size": ${HIDDEN_SIZE},
+  "tensor_model_parallel_size": ${TENSOR_MODEL_PARALLEL_SIZE},
+  "pipeline_model_parallel_size": ${PIPELINE_MODEL_PARALLEL_SIZE},
+  "context_parallel_size": ${CONTEXT_PARALLEL_SIZE},
+  "seq_length": ${SEQ_LEN},
+  "micro_batch_size": ${MICRO_BATCH_SIZE},
+  "global_batch_size": ${GLOBAL_BATCH_SIZE},
+  "lr": ${LR},
+  "min_lr": ${MIN_LR},
+  "iters": ${ITERS},
+  "log_interval": ${LOG_INTERVAL},
+  "gpus_per_node": ${GPUS_PER_NODE},
+  "nnodes": ${NNODES},
+  "nsys": ${NSYS},
+  "nsys_start": ${NSYS_START},
+  "nsys_end": ${NSYS_END},
+  "nsys_graph_trace": "${NSYS_GRAPH_TRACE}",
+  "slurm_job_id": "${SLURM_JOB_ID:-local}"
+}
+JSON
+
+# --timing-log-level 2 exposes forward-compute / backward-compute separately
+# from the forward-backward total, which is what shows where time actually went.
+# --log-throughput adds analytical TFLOP/s/GPU alongside the wall-clock number.
+options=" \
+    ${DATA_ARGS} \
+    ${CUDA_GRAPH_ARGS} \
+    ${PROFILE_ARGS} \
+    --tensor-model-parallel-size ${TENSOR_MODEL_PARALLEL_SIZE} \
+    --pipeline-model-parallel-size ${PIPELINE_MODEL_PARALLEL_SIZE} \
+    --context-parallel-size ${CONTEXT_PARALLEL_SIZE} \
+    --sequence-parallel \
+    --use-distributed-optimizer \
+    --overlap-param-gather \
+    --overlap-grad-reduce \
+    --untie-embeddings-and-output-weights \
+    --init-method-std 0.02 \
+    --position-embedding-type none \
+    --hybrid-layer-pattern ${HYBRID_LAYER_PATTERN} \
+    --hidden-size ${HIDDEN_SIZE} \
+    ${FFN_HIDDEN_SIZE:+--ffn-hidden-size ${FFN_HIDDEN_SIZE}} \
+    --num-attention-heads ${NUM_ATTENTION_HEADS} \
+    --group-query-attention \
+    --num-query-groups ${NUM_QUERY_GROUPS} \
+    --seq-length ${SEQ_LEN} \
+    --max-position-embeddings ${SEQ_LEN} \
+    --micro-batch-size ${MICRO_BATCH_SIZE} \
+    --global-batch-size ${GLOBAL_BATCH_SIZE} \
+    --train-iters ${ITERS} \
+    --lr-decay-iters ${ITERS} \
+    --lr ${LR} \
+    --min-lr ${MIN_LR} \
+    --lr-decay-style cosine \
+    --weight-decay 0.1 \
+    --clip-grad 1.0 \
+    --attention-dropout 0.0 \
+    --hidden-dropout 0.0 \
+    --disable-bias-linear \
+    --normalization RMSNorm \
+    --adam-beta1 0.9 \
+    --adam-beta2 0.95 \
+    --bf16 \
+    --use-mcore-models \
+    --spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec \
+    --no-create-attention-mask-in-dataloader \
+    --data-cache-path ${DATACACHE_DIR} \
+    --distributed-backend nccl \
+    --log-interval ${LOG_INTERVAL} \
+    --log-throughput \
+    --timing-log-level 2 \
+    --timing-log-option minmax \
+    --log-timers-to-tensorboard \
+    --eval-iters 0 \
+    --eval-interval $((ITERS + 1)) \
+    --tensorboard-dir ${TENSORBOARD_DIR}"
+
+read -r -d '' CMD <<EOF || true
+set -euo pipefail
+export PYTHONPATH=${REPO_ROOT}/te_patches:${REPO_ROOT}:\${PYTHONPATH:-}
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NCCL_IB_SL=1
+export NCCL_IB_TIMEOUT=19
+export NCCL_IB_QPS_PER_CONNECTION=4
+export TRITON_CACHE_DIR=/tmp/triton-cache
+export TRITON_HOME=\${TRITON_CACHE_DIR}
+export WANDB_MODE=disabled
+cd ${REPO_ROOT}
+PYBIN=\${PYBIN:-python}
+
+LAUNCH="\${PYBIN} -m torch.distributed.run \
+  --nnodes=${NNODES} \
+  --nproc_per_node=${GPUS_PER_NODE} \
+  --node_rank=\${SLURM_NODEID} \
+  --master_addr=${MASTER_ADDR} \
+  --master_port=${MASTER_PORT} \
+  pretrain_mamba.py ${options}"
+
+if [[ "${NSYS}" == "1" ]]; then
+  NSYS_BASE=${RUN_DIR}/nsys_${RUN_TAG}_node\${SLURM_NODEID}
+  nsys profile -s none -t nvtx,cuda \
+    -o \${NSYS_BASE} \
+    --force-overwrite true \
+    --cuda-graph-trace=${NSYS_GRAPH_TRACE} \
+    --capture-range=cudaProfilerApi --capture-range-end=stop \
+    \${LAUNCH}
+  # Export on the compute node, where the Nsight CLI is available. The offline
+  # analyzer reads SQLite directly and therefore also works on login nodes
+  # without an `nsys` installation. Export through /tmp because some shared
+  # filesystems do not provide the locking mode required by SQLite.
+  if [[ -f "\${NSYS_BASE}.nsys-rep" ]]; then
+    NSYS_SQLITE_TMP=/tmp/nsys_${RUN_TAG}_job${SLURM_JOB_ID:-local}_node\${SLURM_NODEID}.sqlite
+    if nsys export --type=sqlite --force-overwrite=true \
+      --output="\${NSYS_SQLITE_TMP}" "\${NSYS_BASE}.nsys-rep"; then
+      cp -f "\${NSYS_SQLITE_TMP}" "\${NSYS_BASE}.sqlite"
+      echo "[bench] exported \${NSYS_BASE}.sqlite"
+    else
+      echo "[WARN] SQLite export failed; retained \${NSYS_BASE}.nsys-rep" >&2
+    fi
+  fi
+else
+  \${LAUNCH}
+fi
+EOF
+
+srun --nodes="${NNODES}" \
+     --ntasks-per-node=1 \
+     --container-image="${CONTAINER}" \
+     --container-mounts="${MOUNTS}" \
+     --container-workdir="${REPO_ROOT}" \
+     --no-container-mount-home \
+     bash -c "${CMD}" 2>&1 | tee "${RUN_DIR}/stdout.log"
+
+echo "[bench] wrote ${RUN_DIR}/stdout.log"

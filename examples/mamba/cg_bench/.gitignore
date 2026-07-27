@@ -1,0 +1,4 @@
+__pycache__/
+*_results.csv
+*_results.json
+nsys_analysis/

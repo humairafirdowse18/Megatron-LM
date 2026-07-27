@@ -3828,20 +3828,45 @@ def train(
             max_attention_logit = None
         else:
             ft_integration.on_training_step_start()
-            (
-                loss_dict,
-                skipped_iter,
-                should_checkpoint,
-                should_exit,
-                exit_code,
-                grad_norm,
-                num_zeros_in_grad,
-                max_attention_logit,
-            ) = train_step(
-                forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
-                pg_collection=pg_collection,
-                p2p_communicator=p2p_communicator,
+            profile_nsys_step = (
+                args.profile
+                and not args.use_pytorch_profiler
+                and (
+                    len(args.profile_ranks) == 0
+                    or torch.distributed.get_rank() in args.profile_ranks
+                )
+                and args.profile_step_start <= iteration < args.profile_step_end
             )
+            if profile_nsys_step:
+                # Nsight's CUDA/NVTX capture has many operator ranges but no
+                # stable top-level iteration boundary. This range lets offline
+                # analysis assign API calls, kernels, and gaps to one train step.
+                torch.cuda.nvtx.range_push(f"train_step_{iteration + 1}")
+            try:
+                (
+                    loss_dict,
+                    skipped_iter,
+                    should_checkpoint,
+                    should_exit,
+                    exit_code,
+                    grad_norm,
+                    num_zeros_in_grad,
+                    max_attention_logit,
+                ) = train_step(
+                    forward_step_func,
+                    train_data_iterator,
+                    model,
+                    optimizer,
+                    opt_param_scheduler,
+                    config,
+                    forward_backward_func,
+                    iteration=iteration,
+                    pg_collection=pg_collection,
+                    p2p_communicator=p2p_communicator,
+                )
+            finally:
+                if profile_nsys_step:
+                    torch.cuda.nvtx.range_pop()
             ft_integration.on_training_step_end()
             if _maybe_raise_workload_exception is not None and iteration != start_iteration:
                 _maybe_raise_workload_exception()

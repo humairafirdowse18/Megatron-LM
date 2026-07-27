@@ -1,0 +1,261 @@
+#!/bin/bash
+#SBATCH --job-name=mamba-sft-cudagraph-packedseq
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:8
+#SBATCH --exclusive
+#SBATCH --time=01:00:00
+# NOTE: --account / --partition are intentionally left out of the header so you
+# can pass them on the command line (see the sbatch example at the bottom), e.g.
+#   sbatch --account=coreai_dlalgo_nemorl --partition=batch examples/mamba/sft_cudagraph_packedseq.sub
+#
+# -----------------------------------------------------------------------------
+# Mamba/Transformer-hybrid SFT with CUDA graphs for PACKED (variable-length)
+# sequences. Enables the feature from branch sj/cudagraph-packedseq:
+#   --cuda-graph-impl transformer_engine
+#   --cuda-graph-scope mamba attn
+#   --cuda-graph-max-packed-seqs <N>
+# plus the mandatory te_patches/ PYTHONPATH hook.
+#
+# This is a template: fill in the ==== FILL ME ==== paths (container, data,
+# tokenizer, checkpoint) before submitting. Everything runs inside a pyxis/enroot
+# container via srun, matching the cluster setup used by nemo-rl/perf_runs.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ============================ Cluster / container ============================
+# Defaults mirror perf_runs/common.sh. Override any of these from the environment.
+# Default = the Megatron-core CI-dev image built from 2026 main (commit bd0872d,
+# 2026-07-20). This is the RIGHT vintage for this fork: it has the new TE
+# (te.pytorch / TEFusedResidualRMSNorm) that ~2026 megatron-core imports, plus a
+# transformers compatible with SFTTokenizer. sna runs pretrain_mamba.py --sft on it.
+#   Do NOT use matthieul's megatron-dev-img-05142025: its May-2025 TE lacks
+#   te.pytorch -> "module 'transformer_engine' has no attribute 'pytorch'".
+#   Do NOT use nemo:nightly: its newer transformers returns a tokenizers.Encoding
+#   from apply_chat_template -> "'tokenizers.Encoding' object has no attribute 'copy'".
+CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/containers/megatron-lm-main-20260720/megatron_lm_mcore_ci_dev_main_20260720_14192275.sqsh}"
+# Bind-mount Lustre (data/ckpt/logs) and home (the repo lives here). Keep large
+# outputs OFF the 10 GB home quota -> point SAVE/DATA at Lustre.
+MOUNTS="${MOUNTS:-/lustre:/lustre,/home/humairafirdo:/home/humairafirdo}"
+REPO_ROOT="${REPO_ROOT:-/home/humairafirdo/Megatron-LM}"
+
+# ============================ Model (8B hybrid) =============================
+# Same 56-layer 8B hybrid architecture as examples/mamba/train.sh. Adjust to match
+# the checkpoint you are fine-tuning.
+TENSOR_MODEL_PARALLEL_SIZE="${TP:-4}"
+PIPELINE_MODEL_PARALLEL_SIZE="${PP:-1}"
+CONTEXT_PARALLEL_SIZE="${CP:-1}"
+HYBRID_LAYER_PATTERN="M-M-M--M-M*-M-M-M-M--M*-M-M-M-M-M*--M-M-M-M-M*-M--M-M-M-"
+HIDDEN_SIZE=4096
+NUM_ATTENTION_HEADS=32
+NUM_QUERY_GROUPS=8
+
+# ============================ SFT / packing ================================
+SEQ_LEN="${SEQ_LEN:-8192}"          # packed sequence length
+MICRO_BATCH_SIZE=1                   # REQUIRED for packing (asserted in get_batch)
+GLOBAL_BATCH_SIZE="${GBS:-32}"
+
+# ============================ CUDA graph knobs =============================
+# MAX_SEQS = fixed cu_seqlens bucket size. Set to ~P90/P99 of the number of docs
+# packed per micro-batch in YOUR dataset. 64 covers ~96% of typical SFT batches;
+# batches above it fall back to eager forward (still correct).
+CUDA_GRAPH_MAX_PACKED_SEQS="${MAX_SEQS:-64}"
+
+# ============================ Data / IO ====================================
+# Two ways to supply SFT data (pick ONE):
+#   1. BLEND_PATH: a per-split blend JSON with train/valid/test entries, each
+#      pointing at a {"messages":[...]} jsonl (or pre-packed jsonl). Preferred:
+#      this is what pmannan/sna use and gives a real train/val split.
+#   2. DATA_PATH: a single {"messages":[...]} jsonl (uses --split below).
+# If BLEND_PATH is set (default), it wins and DATA_PATH/--split are ignored.
+BLEND_PATH="${BLEND_PATH:-/lustre/fsw/portfolios/coreai/users/pmannan/nemotron_ultra_sft_data/blend_jan21.json}"
+DATA_PATH="${DATA_PATH:-}"           # only used if BLEND_PATH is empty
+DATA_SPLIT="${DATA_SPLIT:-99,1,0}"   # only used with DATA_PATH
+# TOKENIZER_MODEL: a HuggingFace tokenizer DIRECTORY. SFTTokenizer calls
+#            transformers.AutoTokenizer.from_pretrained on it.
+TOKENIZER_MODEL="${TOKENIZER_MODEL:-/lustre/fsw/portfolios/coreai/users/pmannan/nemotron_ultra_sft_data/tokenizer}"
+SFT_PROMPT_FORMAT="${SFT_PROMPT_FORMAT:-identity}"
+# LOAD_DIR: Megatron-format hybrid checkpoint to fine-tune. EMPTY (default) =
+#            random-init, which is what you want for a feature/perf smoke test.
+LOAD_DIR="${LOAD_DIR:-}"
+SAVE_DIR="${SAVE_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/humairafirdo/mamba_sft_cg/checkpoints}"
+TENSORBOARD_DIR="${TENSORBOARD_DIR:-${SAVE_DIR}/tb}"
+DATACACHE_DIR="${DATACACHE_DIR:-${SAVE_DIR}/data-cache}"
+
+TRAIN_SAMPLES="${TRAIN_SAMPLES:-200000}"
+LR="${LR:-1e-5}"
+MIN_LR="${MIN_LR:-1e-6}"
+
+# ============================ Weights & Biases =============================
+# Logging goes to TensorBoard (${TENSORBOARD_DIR}) always. Set WANDB_PROJECT to
+# ALSO stream metrics to Weights & Biases. Megatron only inits the wandb run on
+# the last rank, so this is cheap. Leave WANDB_PROJECT empty to disable wandb.
+#
+# Auth: set WANDB_API_KEY in your submit environment (it is forwarded into the
+#       container below). Or set WANDB_MODE=offline to log locally to
+#       WANDB_SAVE_DIR without needing network/login (sync later with `wandb sync`).
+WANDB_PROJECT="${WANDB_PROJECT:-}"
+WANDB_EXP_NAME="${WANDB_EXP_NAME:-${SLURM_JOB_NAME:-mamba-sft-cudagraph}-${SLURM_JOB_ID:-local}}"
+WANDB_ENTITY="${WANDB_ENTITY:-}"
+WANDB_SAVE_DIR="${WANDB_SAVE_DIR:-${SAVE_DIR}/wandb}"
+WANDB_MODE="${WANDB_MODE:-online}"    # online | offline | disabled
+
+# Build the wandb args only when a project is set (empty otherwise).
+if [[ -n "${WANDB_PROJECT}" ]]; then
+  WANDB_ARGS="--wandb-project ${WANDB_PROJECT} \
+    --wandb-exp-name ${WANDB_EXP_NAME} \
+    --wandb-save-dir ${WANDB_SAVE_DIR}"
+  if [[ -n "${WANDB_ENTITY}" ]]; then
+    WANDB_ARGS="${WANDB_ARGS} --wandb-entity ${WANDB_ENTITY}"
+  fi
+  mkdir -p "${WANDB_SAVE_DIR}"
+else
+  WANDB_ARGS=""
+fi
+
+# ============================ torchrun rendezvous ==========================
+GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
+MASTER_ADDR="$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n1)"
+MASTER_PORT="${MASTER_PORT:-29500}"
+NNODES="${SLURM_NNODES}"
+
+# Select data args: prefer the per-split blend; fall back to a single jsonl.
+if [[ -n "${BLEND_PATH}" ]]; then
+  DATA_ARGS="--per-split-data-args-path ${BLEND_PATH} --no-mmap-bin-files"
+elif [[ -n "${DATA_PATH}" ]]; then
+  DATA_ARGS="--data-path ${DATA_PATH} --split ${DATA_SPLIT}"
+else
+  echo "[ERROR] Set BLEND_PATH or DATA_PATH." >&2; exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Megatron args. --spec selects the Mamba hybrid stack; --sft turns on packed
+# SFT; the three --cuda-graph-* flags + te_patches PYTHONPATH turn on the feature.
+# ---------------------------------------------------------------------------
+options=" \
+    --sft \
+    --sft-tokenizer-prompt-format ${SFT_PROMPT_FORMAT} \
+    --cuda-graph-impl transformer_engine \
+    --cuda-graph-scope mamba attn \
+    --cuda-graph-max-packed-seqs ${CUDA_GRAPH_MAX_PACKED_SEQS} \
+    --tensor-model-parallel-size ${TENSOR_MODEL_PARALLEL_SIZE} \
+    --pipeline-model-parallel-size ${PIPELINE_MODEL_PARALLEL_SIZE} \
+    --context-parallel-size ${CONTEXT_PARALLEL_SIZE} \
+    --sequence-parallel \
+    --use-distributed-optimizer \
+    --overlap-param-gather \
+    --overlap-grad-reduce \
+    --untie-embeddings-and-output-weights \
+    --init-method-std 0.02 \
+    --position-embedding-type none \
+    --hybrid-layer-pattern ${HYBRID_LAYER_PATTERN} \
+    --hidden-size ${HIDDEN_SIZE} \
+    --num-attention-heads ${NUM_ATTENTION_HEADS} \
+    --group-query-attention \
+    --num-query-groups ${NUM_QUERY_GROUPS} \
+    --seq-length ${SEQ_LEN} \
+    --max-position-embeddings ${SEQ_LEN} \
+    --micro-batch-size ${MICRO_BATCH_SIZE} \
+    --global-batch-size ${GLOBAL_BATCH_SIZE} \
+    --train-samples ${TRAIN_SAMPLES} \
+    --lr ${LR} \
+    --min-lr ${MIN_LR} \
+    --lr-decay-style cosine \
+    --weight-decay 0.1 \
+    --clip-grad 1.0 \
+    --attention-dropout 0.0 \
+    --hidden-dropout 0.0 \
+    --disable-bias-linear \
+    --normalization RMSNorm \
+    --adam-beta1 0.9 \
+    --adam-beta2 0.95 \
+    --bf16 \
+    --use-mcore-models \
+    --spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec \
+    --no-create-attention-mask-in-dataloader \
+    ${DATA_ARGS} \
+    --data-cache-path ${DATACACHE_DIR} \
+    --tokenizer-type SFTTokenizer \
+    --tokenizer-model ${TOKENIZER_MODEL} \
+    ${LOAD_DIR:+--load ${LOAD_DIR}} \
+    --save ${SAVE_DIR} \
+    --distributed-backend nccl \
+    --log-interval ${LOG_INTERVAL:-10} \
+    --save-interval ${SAVE_INTERVAL:-2000} \
+    --eval-interval ${EVAL_INTERVAL:-2000} \
+    --eval-iters ${EVAL_ITERS:-32} \
+    --tensorboard-dir ${TENSORBOARD_DIR} \
+    ${WANDB_ARGS}"
+
+mkdir -p "${SAVE_DIR}" "${TENSORBOARD_DIR}" "${DATACACHE_DIR}"
+
+# Command executed INSIDE the container on every node. The te_patches PYTHONPATH
+# hook (sitecustomize.py) is mandatory for CUDA-graph capture with packed seqs.
+read -r -d '' CMD <<EOF || true
+set -euo pipefail
+export PYTHONPATH=${REPO_ROOT}/te_patches:${REPO_ROOT}:\${PYTHONPATH:-}
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NCCL_IB_SL=1
+export NCCL_IB_TIMEOUT=19
+export NCCL_IB_QPS_PER_CONNECTION=4
+export TRITON_CACHE_DIR=/tmp/triton-cache
+export TRITON_HOME=\${TRITON_CACHE_DIR}
+# --- Weights & Biases (only matters when --wandb-project is passed) ---
+# WANDB_API_KEY is expanded at submit time from the launching environment; keep
+# it out of the script/logs by exporting it before sbatch. WANDB_MODE lets you
+# run offline (log locally, sync later) without network/login.
+export WANDB_MODE=${WANDB_MODE}
+export WANDB_API_KEY=${WANDB_API_KEY:-}
+# NOTE: do NOT set TRITON_CACHE_MANAGER=...ParallelFileCacheManager here.
+# That patch asserts Triton <= 3.1; the nemo:nightly container ships a newer
+# Triton, so it aborts with InductorError. (sna kept this disabled too.)
+cd ${REPO_ROOT}
+# On the mcore_ci_dev image the full stack (torch, TE, megatron, transformers,
+# mamba, einops) lives in the default 'python' on PATH (sna uses PYTHON_CMD=python
+# on this exact container). Do NOT force /usr/bin/python3.12 here -- that is only
+# correct for matthieul's older image. Launch distributed via
+# 'python -m torch.distributed.run' so workers inherit the same interpreter.
+PYBIN=\${PYBIN:-python}
+\${PYBIN} -m torch.distributed.run \
+  --nnodes=${NNODES} \
+  --nproc_per_node=${GPUS_PER_NODE} \
+  --node_rank=\${SLURM_NODEID} \
+  --master_addr=${MASTER_ADDR} \
+  --master_port=${MASTER_PORT} \
+  pretrain_mamba.py ${options}
+EOF
+
+srun --nodes="${NNODES}" \
+     --ntasks-per-node=1 \
+     --container-image="${CONTAINER}" \
+     --container-mounts="${MOUNTS}" \
+     --container-workdir="${REPO_ROOT}" \
+     --no-container-mount-home \
+     bash -c "${CMD}"
+
+# -----------------------------------------------------------------------------
+# Submit examples
+# -----------------------------------------------------------------------------
+# Single node, 8xH100, dry-check the plan first with --test-only:
+#   sbatch --account=coreai_dlalgo_nemorl --partition=batch \
+#          examples/mamba/sft_cudagraph_packedseq.sub
+#
+# 4 nodes, override the packed-seq bucket + data paths:
+#   sbatch --nodes=4 --account=coreai_dlalgo_nemorl --partition=batch \
+#          --export=ALL,MAX_SEQS=106,DATA_PATH=/lustre/...,TOKENIZER_MODEL=/lustre/...,LOAD_DIR=/lustre/... \
+#          examples/mamba/sft_cudagraph_packedseq.sub
+#
+# Stream metrics to Weights & Biases (online). Export WANDB_API_KEY first so it
+# is not written into the script; --export=ALL forwards it into the job:
+#   export WANDB_API_KEY=xxxxxxxx
+#   sbatch --account=coreai_dlalgo_nemorl --partition=batch \
+#          --export=ALL,WANDB_PROJECT=mamba-sft-cg,WANDB_ENTITY=my-team,WANDB_EXP_NAME=cg-run1 \
+#          examples/mamba/sft_cudagraph_packedseq.sub
+#
+# Offline wandb (no network/login; logs to ${SAVE_DIR}/wandb, sync later with
+# `wandb sync`):
+#   sbatch --account=coreai_dlalgo_nemorl --partition=batch \
+#          --export=ALL,WANDB_PROJECT=mamba-sft-cg,WANDB_MODE=offline \
+#          examples/mamba/sft_cudagraph_packedseq.sub
+# -----------------------------------------------------------------------------
