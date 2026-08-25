@@ -76,21 +76,10 @@ class PackedSeqParams:
             )
             cu_seqlens_with_max = torch.cat([cu_seqlens, total_tokens_tensor])
             seq_lengths = cu_seqlens_with_max[1:] - cu_seqlens_with_max[:-1]
-            # Clamp to non-negative: cu_seqlens_q_padded may not be strictly
-            # monotonic when context parallelism slices sequences across ranks,
-            # or when padded cumulative lengths exceed total_tokens (e.g. the
-            # appended total_tokens sentinel is smaller than cu_seqlens[-1]
-            # due to padding). In either case the diff can go negative, which
-            # causes torch.repeat_interleave to fail.
-            seq_lengths = seq_lengths.clamp(min=0)
-            # Pass output_size to avoid a GPU->CPU sync that repeat_interleave
-            # performs when the output length is unknown.
             # Example: [5, 2, 4, 5] -> [0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3]
             self.seq_idx = (
                 torch.repeat_interleave(
-                    torch.arange(seq_lengths.numel(), device=cu_seqlens.device),
-                    seq_lengths,
-                    output_size=self.total_tokens,
+                    torch.arange(seq_lengths.numel(), device=cu_seqlens.device), seq_lengths, output_size=self.total_tokens
                 )
                 .to(torch.int32)
                 .unsqueeze(0)  # Add a batch dimension
