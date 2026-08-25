@@ -82,14 +82,15 @@ class PackedSeqParams:
             # appended total_tokens sentinel is smaller than cu_seqlens[-1]
             # due to padding). In either case the diff can go negative, which
             # causes torch.repeat_interleave to fail.
-            # Clamping can raise the total above total_tokens, so repeat_interleave
-            # must not be given output_size here. Both CUDA graph paths return
-            # early above, so they never depend on this branch.
             seq_lengths = seq_lengths.clamp(min=0)
+            # Pass output_size to avoid a GPU->CPU sync that repeat_interleave
+            # performs when the output length is unknown.
             # Example: [5, 2, 4, 5] -> [0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3]
             self.seq_idx = (
                 torch.repeat_interleave(
-                    torch.arange(seq_lengths.numel(), device=cu_seqlens.device), seq_lengths
+                    torch.arange(seq_lengths.numel(), device=cu_seqlens.device),
+                    seq_lengths,
+                    output_size=self.total_tokens,
                 )
                 .to(torch.int32)
                 .unsqueeze(0)  # Add a batch dimension

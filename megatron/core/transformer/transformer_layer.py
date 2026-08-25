@@ -1429,14 +1429,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # Replace real PSP with fixed-size dummy PSP (buffers now updated in-place).
             kwargs = dict(kwargs)
             kwargs['packed_seq_params'] = self._cuda_graph_psp
-        else:
-            assert (kwargs.get('inference_context') is None) and (
-                kwargs.get('packed_seq_params') is None
-            ), (
-                "CUDA graph accepts only Tensor inputs. "
-                "inference_context and packed_seq_params are excluded from input list. "
-                "For inference cuda graph, please use cuda_graph_impl=local instead."
-            )
 
         if self.config.delay_offload_until_cuda_graph:
             self.off_interface.enter_replay()
