@@ -26,7 +26,11 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import is_graph_capturing
+from megatron.core.transformer.cuda_graphs import (
+    is_graph_capturing,
+    record_packed_cg_fallback,
+    record_packed_cg_replay,
+)
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
@@ -1386,6 +1390,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             bucket_max = self._cuda_graph_psp_buffers['cu_seqlens_q'].shape[0]  # max_seqs + 1
             if psp.cu_seqlens_q.shape[0] > bucket_max:
                 # Actual N_docs exceeds bucket -> fall back to non-CG forward.
+                record_packed_cg_fallback()
                 return self.forward(*args, **kwargs)
 
         context = None
@@ -1430,9 +1435,33 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             kwargs = dict(kwargs)
             kwargs['packed_seq_params'] = self._cuda_graph_psp
 
+            # rotary_pos_emb is computed upstream (once per iteration, before this
+            # layer runs) from the REAL packed_seq_params, so its length tracks the
+            # longest document in this micro-batch's pack -- a different value every
+            # micro-batch. The graph was captured with rotary_pos_emb sized to the
+            # full pack capacity (_cuda_graph_seq_length), since capture uses a
+            # static dummy PSP-less path. Pad/truncate to that fixed length here so
+            # the replay input always matches the captured static buffer's shape.
+            # Padding with extra positions is safe: no single document can exceed
+            # the pack capacity, so the real rotary values needed are always a
+            # prefix of the padded tensor.
+            for key in ('rotary_pos_emb', 'rotary_pos_cos', 'rotary_pos_sin'):
+                tensor = kwargs.get(key)
+                if tensor is None or tensor.shape[0] == self._cuda_graph_seq_length:
+                    continue
+                target_len = self._cuda_graph_seq_length
+                actual_len = tensor.shape[0]
+                if actual_len > target_len:
+                    tensor = tensor[:target_len]
+                else:
+                    pad = tensor.new_zeros((target_len - actual_len,) + tuple(tensor.shape[1:]))
+                    tensor = torch.cat([tensor, pad], dim=0)
+                kwargs[key] = tensor
+
         if self.config.delay_offload_until_cuda_graph:
             self.off_interface.enter_replay()
 
+        record_packed_cg_replay()
         try:
             return self._te_cuda_graph_replay_impl(args, kwargs, context)
         finally:

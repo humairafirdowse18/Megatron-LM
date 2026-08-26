@@ -103,6 +103,34 @@ _CUDA_GRAPH_STREAM_POOLS = None
 _CUDA_GRAPH_STREAM_NEXT_SLOT = 0
 logger = logging.getLogger(__name__)
 
+# Aggregate packed-sequence CUDA-graph replay/fallback decisions across all
+# TransformerLayer instances on this rank (see TransformerLayer's per-layer
+# multi-bucket fallback in _te_cuda_graph_replay). Both counters are plain
+# host-side Python ints incremented from tensor .shape lookups (already-
+# resident metadata, not .item()), so recording a decision never introduces
+# a GPU-CPU sync and never touches the captured graph region itself -- the
+# increment happens in the eager wrapper that decides whether to launch the
+# graph, not inside the graph.
+_PACKED_CG_REPLAY_COUNT = 0
+_PACKED_CG_FALLBACK_COUNT = 0
+
+
+def record_packed_cg_replay() -> None:
+    """Record that a packed-sequence CUDA graph was replayed (not a fallback)."""
+    global _PACKED_CG_REPLAY_COUNT
+    _PACKED_CG_REPLAY_COUNT += 1
+
+
+def record_packed_cg_fallback() -> None:
+    """Record that a packed-sequence CUDA graph replay fell back to eager forward."""
+    global _PACKED_CG_FALLBACK_COUNT
+    _PACKED_CG_FALLBACK_COUNT += 1
+
+
+def get_packed_cg_counts() -> tuple[int, int]:
+    """Return (replay_count, fallback_count) accumulated on this rank so far."""
+    return _PACKED_CG_REPLAY_COUNT, _PACKED_CG_FALLBACK_COUNT
+
 
 def _get_cuda_graph_stream() -> torch.cuda.Stream:
     """Assign local CUDA-graph runners across a bounded set of distinct streams.
