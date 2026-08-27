@@ -26,11 +26,7 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import (
-    is_graph_capturing,
-    record_packed_cg_fallback,
-    record_packed_cg_replay,
-)
+from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
@@ -1390,7 +1386,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             bucket_max = self._cuda_graph_psp_buffers['cu_seqlens_q'].shape[0]  # max_seqs + 1
             if psp.cu_seqlens_q.shape[0] > bucket_max:
                 # Actual N_docs exceeds bucket -> fall back to non-CG forward.
-                record_packed_cg_fallback()
                 return self.forward(*args, **kwargs)
 
         context = None
@@ -1461,7 +1456,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.config.delay_offload_until_cuda_graph:
             self.off_interface.enter_replay()
 
-        record_packed_cg_replay()
         try:
             return self._te_cuda_graph_replay_impl(args, kwargs, context)
         finally:

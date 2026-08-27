@@ -118,7 +118,7 @@ from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
 )
 from megatron.core.resharding.refit import swap_model_weights
-from megatron.core.transformer.cuda_graphs import TECudaGraphHelper, get_packed_cg_counts
+from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
@@ -2052,20 +2052,6 @@ def pretrain(
                 raise
 
         print_datetime('after training is done')
-
-        # cg_bench diagnostics (examples/mamba/cg_bench): report this rank's
-        # packed-sequence CUDA-graph replay/fallback decision counts, if any
-        # were recorded (see TransformerLayer._te_cuda_graph_replay and
-        # cuda_graphs.record_packed_cg_replay/fallback). Gated on
-        # MCORE_CG_BENCH_LOG so it's opt-in and matches the log-line format
-        # examples/mamba/cg_bench/analyze.py already parses.
-        if os.getenv('MCORE_CG_BENCH_LOG') == '1':
-            _cg_replay_count, _cg_fallback_count = get_packed_cg_counts()
-            if _cg_replay_count or _cg_fallback_count:
-                print_rank_0(
-                    f'[cg-bench] packed_replay_count={_cg_replay_count} '
-                    f'packed_fallback_count={_cg_fallback_count}'
-                )
 
         if not cfg_container.validation.skip_train and cfg_container.checkpoint.save and iteration != 0 and iteration % cfg_container.checkpoint.save_interval != 0:
             save_checkpoint_and_time(

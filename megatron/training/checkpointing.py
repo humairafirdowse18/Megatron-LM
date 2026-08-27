@@ -2541,13 +2541,14 @@ def load_checkpoint(
     # Bridge and other external converters may omit the cached args blob. In that
     # case the source architecture is unknown; missing args must not be treated as
     # proof that a HybridModel checkpoint came from GPTModel.
-    checkpoint_has_args = (
+    ckpt_args = types.SimpleNamespace()
+    if (
         ckpt_format in ('torch_dist', 'fsdp_dtensor')
         and state_dict is not None
-        and state_dict.get('args') is not None
-    )
-    ckpt_args = state_dict['args'] if checkpoint_has_args else types.SimpleNamespace()
-
+        and 'args' in state_dict
+    ):
+        ckpt_args = state_dict.get('args') or types.SimpleNamespace()
+    
     # Both model-space torch_dist and fsdp_dtensor checkpoints carry model-keyed
     # optimizer state that can be retargeted from GPTModel to HybridModel.
     gpt_compat_layer_maps, gpt_compat_load_optim = (
