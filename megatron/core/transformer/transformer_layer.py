@@ -51,6 +51,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Packed-sequence offsets must be explicit tensor inputs to TE graphs when
+# pipeline parallelism has more than one stage. The pipeline schedule keeps
+# multiple microbatches alive between forward and backward, so one shared
+# PackedSeqParams buffer cannot safely describe every in-flight microbatch.
+_PACKED_SEQ_CG_CU_SEQLENS_Q = "_packed_seq_cg_cu_seqlens_q"
+_PACKED_SEQ_CG_CU_SEQLENS_KV = "_packed_seq_cg_cu_seqlens_kv"
+
 
 def _get_offloading_interface():
     """Get the offloading interface for fine-grained activation offloading."""
@@ -1244,6 +1251,27 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             _max_seqs = (
                 getattr(_args, 'cuda_graph_max_packed_seqs', None) or CUDA_GRAPH_MAX_PACKED_SEQS
             )
+            self._use_pp_packed_attn_cg_inputs = (
+                self.config.cuda_graph_impl == "transformer_engine"
+                and self.config.pipeline_model_parallel_size > 1
+                and CudaGraphModule.attn in self.config.cuda_graph_modules
+            )
+
+            if self._use_pp_packed_attn_cg_inputs:
+                # TE owns the lifetime of sample tensor inputs for every graph slot and only
+                # reuses them when the PP schedule says the corresponding backward has finished.
+                # Flatten PackedSeqParams into ordinary tensor kwargs so cu_seqlens from one
+                # in-flight microbatch cannot be overwritten by a later microbatch.
+                _, packed_seq_buffers = PackedSeqParams.create_dummy_for_cuda_graph(
+                    seq_length, max_seqs=_max_seqs
+                )
+                static_inputs[_PACKED_SEQ_CG_CU_SEQLENS_Q] = packed_seq_buffers['cu_seqlens_q']
+                static_inputs[_PACKED_SEQ_CG_CU_SEQLENS_KV] = packed_seq_buffers[
+                    'cu_seqlens_kv'
+                ]
+                self._cuda_graph_packed_seq_target_len = _max_seqs + 1
+                return static_inputs
+
             # All TransformerLayer instances with the same config share the SAME dict
             # and SAME underlying tensors. Updating once per micro-batch in
             # _te_cuda_graph_replay propagates to all layers' graphs.
@@ -1324,10 +1352,26 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states = self.off_interface.backward_record(hidden_states)
                 kwargs["hidden_states"] = hidden_states
 
-        # Inject dummy PSP so graph captures the THD (packed sequence) code path.
-        # PSP is NOT in static_inputs/sample_kwargs because TE's make_graphed_callables
-        # calls .shape on every kwarg value, which fails for non-tensor dataclasses.
-        if hasattr(self, '_cuda_graph_psp') and kwargs.get('packed_seq_params') is None:
+        # With PP>1, rebuild PackedSeqParams from explicit tensor graph inputs. This keeps
+        # the usual THD attention interface while allowing make_graphed_callables() to own
+        # an independent (or schedule-safe reused) input buffer for every graph slot.
+        cu_seqlens_q = kwargs.pop(_PACKED_SEQ_CG_CU_SEQLENS_Q, None)
+        cu_seqlens_kv = kwargs.pop(_PACKED_SEQ_CG_CU_SEQLENS_KV, None)
+        if cu_seqlens_q is not None or cu_seqlens_kv is not None:
+            assert cu_seqlens_q is not None and cu_seqlens_kv is not None
+            kwargs = dict(kwargs)
+            kwargs['packed_seq_params'] = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+                cu_seqlens_q_padded=None,
+                cu_seqlens_kv_padded=None,
+                max_seqlen_q=self._cuda_graph_seq_length,
+                max_seqlen_kv=self._cuda_graph_seq_length,
+            )
+        # PP=1 has no overlapping forward/backward microbatch lifetimes, so retain the
+        # existing shared-buffer path there.
+        elif hasattr(self, '_cuda_graph_psp') and kwargs.get('packed_seq_params') is None:
             kwargs = dict(kwargs)
             kwargs['packed_seq_params'] = self._cuda_graph_psp
         context = None
@@ -1371,9 +1415,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         CUDA graph replay for this layer using TE interface.
 
-        Copies PackedSeqParams tensor fields into the captured graph's shared
-        buffers. Non-tensor int fields keep their capture-time constants.
-        Non-Tensor kwargs (inference_context) are filtered out.
+        For PP>1 attention graphs, flattens PackedSeqParams tensor fields into
+        schedule-owned graph inputs. PP=1 retains the shared-buffer fast path.
+        Non-tensor int fields keep their capture-time constants, and unsupported
+        non-Tensor kwargs (for example inference_context) are filtered out.
 
         Multi-bucket fallback: if the actual packed-sequence count exceeds the
         CG bucket size (--cuda-graph-max-packed-seqs), falls back to a non-CG
@@ -1382,7 +1427,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         batches run without CG overhead.
         """
         psp = kwargs.get('packed_seq_params')
-        if psp is not None and hasattr(self, '_cuda_graph_psp_buffers'):
+        if psp is not None and getattr(self, '_use_pp_packed_attn_cg_inputs', False):
+            bucket_max = self._cuda_graph_packed_seq_target_len
+            if psp.cu_seqlens_q.shape[0] > bucket_max:
+                # Actual N_docs exceeds bucket -> fall back to non-CG forward.
+                return self.forward(*args, **kwargs)
+        elif psp is not None and hasattr(self, '_cuda_graph_psp_buffers'):
             bucket_max = self._cuda_graph_psp_buffers['cu_seqlens_q'].shape[0]  # max_seqs + 1
             if psp.cu_seqlens_q.shape[0] > bucket_max:
                 # Actual N_docs exceeds bucket -> fall back to non-CG forward.
@@ -1398,7 +1448,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             kwargs = {}
 
         psp = kwargs.get('packed_seq_params')
-        if psp is not None and hasattr(self, '_cuda_graph_psp_buffers'):
+        if psp is not None and getattr(self, '_use_pp_packed_attn_cg_inputs', False):
+            psp.ensure_cg_padded(self._cuda_graph_packed_seq_target_len)
+            kwargs = dict(kwargs)
+            kwargs.pop('packed_seq_params')
+            kwargs[_PACKED_SEQ_CG_CU_SEQLENS_Q] = psp._cg_padded_q
+            kwargs[_PACKED_SEQ_CG_CU_SEQLENS_KV] = psp._cg_padded_kv
+        elif psp is not None and hasattr(self, '_cuda_graph_psp_buffers'):
             bufs = self._cuda_graph_psp_buffers
             target_len = bufs['cu_seqlens_q'].shape[0]  # = max_seqs + 1
 
@@ -1430,6 +1486,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             kwargs = dict(kwargs)
             kwargs['packed_seq_params'] = self._cuda_graph_psp
 
+        if psp is not None and (
+            getattr(self, '_use_pp_packed_attn_cg_inputs', False)
+            or hasattr(self, '_cuda_graph_psp_buffers')
+        ):
             # rotary_pos_emb is computed upstream (once per iteration, before this
             # layer runs) from the REAL packed_seq_params, so its length tracks the
             # longest document in this micro-batch's pack -- a different value every
@@ -1464,9 +1524,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
     def _te_cuda_graph_replay_impl(self, args, kwargs, context):
         """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""
-        # Cannot delegate to super()._te_cuda_graph_replay: it rejects every non-Tensor
-        # kwarg, whereas the packed-sequence graphs are replayed with a dummy
-        # PackedSeqParams whose tensor fields alias the shared replay buffers.
+        # Cannot delegate to super()._te_cuda_graph_replay: the PP=1 packed-sequence path
+        # still passes a dummy PackedSeqParams whose tensor fields alias shared buffers.
         kwargs_filtered = {
             k: v
             for k, v in kwargs.items()
