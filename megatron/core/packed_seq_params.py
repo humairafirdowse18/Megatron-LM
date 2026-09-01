@@ -16,7 +16,8 @@ CUDA_GRAPH_MAX_PACKED_SEQS: int = 2048
 
 
 # Module-level cache for shared CUDA graph buffer tensors.
-# Key: (tag, seq_length, max_seqs, device_id) -> shared buffer dict (or tensor for seq_idx).
+# Key includes tag, token/sequence capacity, CP/capture mode, and device.
+# Values are shared buffer dicts (or a tensor for seq_idx).
 # All layers with the same key share the SAME dict and SAME underlying tensor objects.
 # Updating these tensors once per micro-batch propagates to ALL layers' CUDA graphs.
 _CG_SHARED_BUFFERS: dict = {}
@@ -118,15 +119,23 @@ class PackedSeqParams:
         self._cg_pad_target = target_len
         self._cg_padded_q = PackedSeqParams.pad_cu_seqlens(self.cu_seqlens_q, target_len)
         self._cg_padded_kv = PackedSeqParams.pad_cu_seqlens(self.cu_seqlens_kv, target_len)
-        self._cg_padded_qp = (
-            PackedSeqParams.pad_cu_seqlens(self.cu_seqlens_q_padded, target_len)
+        # TE's THD CUDA-graph interface needs all four offsets to be tensor
+        # inputs. When storage has no gaps, the physical offsets are identical
+        # to the valid-token offsets; materialize that aliasing before capture
+        # or replay instead of representing it with a graph-unsafe None.
+        cu_seqlens_q_padded = (
+            self.cu_seqlens_q_padded
             if self.cu_seqlens_q_padded is not None
-            else None
+            else self.cu_seqlens_q
         )
-        self._cg_padded_kvp = (
-            PackedSeqParams.pad_cu_seqlens(self.cu_seqlens_kv_padded, target_len)
+        cu_seqlens_kv_padded = (
+            self.cu_seqlens_kv_padded
             if self.cu_seqlens_kv_padded is not None
-            else None
+            else self.cu_seqlens_kv
+        )
+        self._cg_padded_qp = PackedSeqParams.pad_cu_seqlens(cu_seqlens_q_padded, target_len)
+        self._cg_padded_kvp = PackedSeqParams.pad_cu_seqlens(
+            cu_seqlens_kv_padded, target_len
         )
 
     # ----------------------------------------------------------------
@@ -140,18 +149,32 @@ class PackedSeqParams:
         max_seqs: int,
         device: torch.device,
         *,
+        context_parallel_size: int = 1,
+        partition_for_attention: bool = False,
         tag: str = 'attn',
     ) -> Dict[str, Tensor]:
         """Return the shared PSP buffer dict for CUDA graph replay.
 
-        All layers with the same (tag, seq_length, max_seqs, device) share the
-        SAME dict object and therefore the SAME underlying tensor objects.
+        Layers with the same tag, capacities, capture mode, and device share
+        the SAME dict object and therefore the SAME underlying tensor objects.
         Updating the tensors once per micro-batch (via copy_()) propagates to
         all layers' captured CUDA graphs simultaneously.
         """
-        key = (tag, seq_length, max_seqs, int(device.index or 0))
+        key = (
+            tag,
+            seq_length,
+            max_seqs,
+            context_parallel_size,
+            partition_for_attention,
+            int(device.index or 0),
+        )
         if key not in _CG_SHARED_BUFFERS:
-            _, buffers = cls.create_dummy_for_cuda_graph(seq_length, max_seqs=max_seqs)
+            _, buffers = cls.create_dummy_for_cuda_graph(
+                seq_length,
+                max_seqs=max_seqs,
+                context_parallel_size=context_parallel_size,
+                partition_for_attention=partition_for_attention,
+            )
             # Object-identity gate; None forces first update.
             buffers['_last_updated_psp'] = None
             _CG_SHARED_BUFFERS[key] = buffers
@@ -171,22 +194,64 @@ class PackedSeqParams:
 
     @classmethod
     def create_dummy_for_cuda_graph(
-        cls, seq_length: int, max_seqs: int = CUDA_GRAPH_MAX_PACKED_SEQS
+        cls,
+        seq_length: int,
+        max_seqs: int = CUDA_GRAPH_MAX_PACKED_SEQS,
+        context_parallel_size: int = 1,
+        partition_for_attention: bool = False,
     ) -> Tuple[PackedSeqParams, Dict[str, Tensor]]:
         """Create a dummy PackedSeqParams for CUDA graph capture.
 
         Returns the dummy PSP and a dict of tensor buffer references that can
         be updated via copy_() during graph replay.
         """
-        cu_seqlens_len = max_seqs + 1
+        assert max_seqs > 0, "CUDA graph packed-sequence capacity must be positive"
+        effective_max_seqs = max_seqs
+        if partition_for_attention:
+            cp_alignment = 2 * context_parallel_size
+            assert seq_length % cp_alignment == 0, (
+                f"Packed CUDA graph sequence length ({seq_length}) must be divisible by "
+                f"2 * context_parallel_size ({cp_alignment})."
+            )
+            aligned_token_units = seq_length // cp_alignment
+            # Every physical THD attention sequence must occupy at least one
+            # CP-alignment unit, so a larger metadata capacity cannot describe
+            # a real attention batch.
+            effective_max_seqs = min(max_seqs, aligned_token_units)
+        cu_seqlens_len = effective_max_seqs + 1
         device = torch.cuda.current_device()
         dtype = torch.int32
 
-        cu_seqlens_q = torch.zeros(cu_seqlens_len, dtype=dtype, device=device)
-        cu_seqlens_q[1:] = seq_length
-        cu_seqlens_kv = cu_seqlens_q.clone()
-        cu_seqlens_q_padded = cu_seqlens_q.clone()
-        cu_seqlens_kv_padded = cu_seqlens_q.clone()
+        if partition_for_attention:
+            # The attention capture sample must itself be a valid THD batch.
+            # Partition token capacity into positive, CP-aligned sequences
+            # instead of a single maximum-length sequence followed by zeros.
+            positive_sequences = effective_max_seqs
+            base_units, extra_units = divmod(aligned_token_units, positive_sequences)
+            dummy_lengths = torch.full(
+                (positive_sequences,),
+                base_units * cp_alignment,
+                dtype=dtype,
+                device=device,
+            )
+            if extra_units:
+                dummy_lengths[:extra_units] += cp_alignment
+
+            cu_seqlens_q = torch.full(
+                (cu_seqlens_len,), seq_length, dtype=dtype, device=device
+            )
+            cu_seqlens_q[0] = 0
+            cu_seqlens_q[1 : positive_sequences + 1] = torch.cumsum(dummy_lengths, dim=0)
+            cu_seqlens_kv = cu_seqlens_q.clone()
+            cu_seqlens_q_padded = cu_seqlens_q.clone()
+            cu_seqlens_kv_padded = cu_seqlens_q.clone()
+        else:
+            # Preserve the established generic/Mamba capture contract.
+            cu_seqlens_q = torch.zeros(cu_seqlens_len, dtype=dtype, device=device)
+            cu_seqlens_q[1:] = seq_length
+            cu_seqlens_kv = cu_seqlens_q.clone()
+            cu_seqlens_q_padded = cu_seqlens_q.clone()
+            cu_seqlens_kv_padded = cu_seqlens_q.clone()
         max_seqlen_q_tensor = torch.tensor([seq_length], dtype=dtype, device=device)
         max_seqlen_kv_tensor = torch.tensor([seq_length], dtype=dtype, device=device)
 
@@ -200,6 +265,9 @@ class PackedSeqParams:
             max_seqlen_kv=seq_length,
             max_seqlen_q_tensor=max_seqlen_q_tensor,
             max_seqlen_kv_tensor=max_seqlen_kv_tensor,
+            # Keep this graph-static. Letting TE infer it with torch.equal()
+            # would synchronize CUDA tensors with the CPU during capture.
+            pad_between_seqs=True,
         )
         buffers = {
             'cu_seqlens_q': cu_seqlens_q,

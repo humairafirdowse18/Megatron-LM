@@ -2392,7 +2392,7 @@ class TECudaGraphHelper:
                 layer is mtp_layer.mtp_model_layer for mtp_layer in chunk_of_the_layer.mtp.layers
             ), "Layer is not in the chunk"
 
-            def get_rotary_pos_emb(transformer_module, transformer_input):
+            def get_rotary_pos_emb(transformer_module, transformer_input, packed_seq=False):
                 if (
                     transformer_module.position_embedding_type == 'rope'
                     and not self.config.multi_latent_attention
@@ -2400,11 +2400,12 @@ class TECudaGraphHelper:
                     rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
                         None, transformer_module.decoder, transformer_input, self.config, None
                     )
-                    if rotary_seq_len not in rotary_pos_emb_cache:
-                        rotary_pos_emb_cache[rotary_seq_len] = transformer_module.rotary_pos_emb(
-                            rotary_seq_len
+                    rotary_cache_key = (rotary_seq_len, packed_seq)
+                    if rotary_cache_key not in rotary_pos_emb_cache:
+                        rotary_pos_emb_cache[rotary_cache_key] = transformer_module.rotary_pos_emb(
+                            rotary_seq_len, packed_seq=packed_seq
                         )
-                    return rotary_pos_emb_cache[rotary_seq_len]
+                    return rotary_pos_emb_cache[rotary_cache_key]
                 else:
                     return None
 
@@ -2428,7 +2429,11 @@ class TECudaGraphHelper:
                 hidden_states = static_inputs.pop("hidden_states")
                 _sample_args = (hidden_states,)
                 if contains_self_attn:
-                    rotary_pos_emb = get_rotary_pos_emb(chunk_of_the_layer, hidden_states)
+                    rotary_pos_emb = get_rotary_pos_emb(
+                        chunk_of_the_layer,
+                        hidden_states,
+                        packed_seq=getattr(layer, '_cuda_graph_uses_packed_attention', False),
+                    )
                     if rotary_pos_emb is not None:
                         static_inputs["rotary_pos_emb"] = rotary_pos_emb
                 _sample_kwargs = static_inputs

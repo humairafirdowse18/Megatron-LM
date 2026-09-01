@@ -330,20 +330,35 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         # Use real (unpadded) cu_seqlens to feed the FLOPs accounting: varlen
         # attention only computes work for real tokens within each chunk.
         update_seqlen_stats_from_cu_seqlens(cu_seqlens)
-        cu_seqlens_for_params = (
+        physical_cu_seqlens = (
             cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
-        )  # TODO(asolergi-nv): Currently there is a bug forcing cu_seqlens to be cu_seqlens_padded
+        )
+        # CUDA graphs capture max_seqlen as a Python constant. Use the configured
+        # token capacity for eager warmup, capture, and replay so batch preparation
+        # does not call Tensor.item() before every graph replay.
+        max_seqlen_for_params = (
+            args.seq_length
+            if getattr(args, 'cuda_graph_impl', 'none') != 'none'
+            else int(max_seqlen.item())
+        )
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
-            cu_seqlens_q=cu_seqlens_for_params,
-            cu_seqlens_kv=cu_seqlens_for_params,
-            cu_seqlens_q_padded=cu_seqlens_padded,
-            cu_seqlens_kv_padded=cu_seqlens_padded,
-            max_seqlen_q=int(max_seqlen.item()),
-            max_seqlen_kv=int(max_seqlen.item()),
+            # Keep compact valid-token boundaries distinct from physical slot
+            # boundaries. TE needs both to mask gaps in packed THD storage.
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=physical_cu_seqlens,
+            cu_seqlens_kv_padded=physical_cu_seqlens,
+            max_seqlen_q=max_seqlen_for_params,
+            max_seqlen_kv=max_seqlen_for_params,
             local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
             cp_group=hybrid_cp_group,
             tokens_per_sample=args.seq_length,
+            # Keep eager warmup, CUDA-graph capture, and replay on the same TE
+            # THD-padding branch. Leaving this as None makes TE compare CUDA
+            # tensors to infer the value and can first compile the CP offset
+            # kernel after graph capture has already started.
+            pad_between_seqs=True,
         )
 
     timers('batch-generator').stop()
