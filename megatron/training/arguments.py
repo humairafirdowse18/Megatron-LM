@@ -2310,6 +2310,7 @@ def _add_network_size_args(parser):
         "moe_aux_loss_coeff",
         "cp_comm_type",
         "cuda_graph_modules",
+        "cuda_graph_max_packed_seqs",
         "cuda_graph_scope",  # deprecated alias; handled manually by --cuda-graph-scope flag
         # no CLI argument exists for these
         "virtual_pipeline_model_parallel_size",

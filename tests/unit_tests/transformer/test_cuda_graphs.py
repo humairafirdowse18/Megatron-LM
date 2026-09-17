@@ -29,6 +29,7 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     CheckpointWithoutOutput,
@@ -51,7 +52,7 @@ from megatron.core.transformer.enums import (
     InferenceCudaGraphScope,
 )
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -73,6 +74,224 @@ fp8_available, _ = check_fp8_support()
 
 
 class TestPackedSeqCudaGraphMetadata:
+    def test_seq_idx_uses_physical_padded_boundaries(self):
+        params = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=torch.tensor([0, 3, 5], dtype=torch.int32),
+            cu_seqlens_kv=torch.tensor([0, 3, 5], dtype=torch.int32),
+            cu_seqlens_q_padded=torch.tensor([0, 4, 8], dtype=torch.int32),
+            cu_seqlens_kv_padded=torch.tensor([0, 4, 8], dtype=torch.int32),
+            total_tokens=8,
+        )
+
+        assert torch.equal(
+            params.seq_idx, torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]], dtype=torch.int32)
+        )
+
+    def test_attention_dummy_allows_odd_capacity_without_context_parallelism(self):
+        params, _ = PackedSeqParams.create_dummy_for_cuda_graph(
+            15,
+            max_seqs=15,
+            context_parallel_size=1,
+            partition_for_attention=True,
+            device=torch.device('cpu'),
+        )
+
+        assert params.cu_seqlens_q.numel() == 16
+        assert torch.equal(params.cu_seqlens_q, torch.arange(16, dtype=torch.int32))
+
+    def test_attention_capacity_and_replay_padding_use_same_cp_clamp(self):
+        _, buffers = PackedSeqParams.create_dummy_for_cuda_graph(
+            4096,
+            max_seqs=2048,
+            context_parallel_size=16,
+            partition_for_attention=True,
+            device=torch.device('cpu'),
+        )
+        assert buffers['cu_seqlens_q'].numel() == 129
+
+        params = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=torch.tensor([0, 3, 7, 10, 16], dtype=torch.int32),
+            cu_seqlens_kv=torch.tensor([0, 3, 7, 10, 16], dtype=torch.int32),
+            cu_seqlens_q_padded=torch.tensor([0, 32, 64, 96, 128], dtype=torch.int32),
+            cu_seqlens_kv_padded=torch.tensor([0, 32, 64, 96, 128], dtype=torch.int32),
+        )
+        params.ensure_cg_padded(buffers['cu_seqlens_q'].numel())
+
+        assert params._cg_padded_q.numel() == 129
+        assert params._cg_padded_qp.numel() == 129
+        assert params._cg_padded_q[-1].item() == 16
+        assert params._cg_padded_qp[-1].item() == 128
+
+    def test_cuda_graph_padding_rejects_metadata_above_capacity(self):
+        with pytest.raises(ValueError, match='exceeding the CUDA graph capacity'):
+            PackedSeqParams.pad_cu_seqlens(
+                torch.tensor([0, 2, 4, 6], dtype=torch.int32), target_len=3
+            )
+
+    def test_mamba_graph_slot_round_trip_preserves_seq_idx_and_physical_offsets(self):
+        params = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=torch.tensor([0, 3, 5], dtype=torch.int32),
+            cu_seqlens_kv=torch.tensor([0, 3, 5], dtype=torch.int32),
+            cu_seqlens_q_padded=torch.tensor([0, 4, 8], dtype=torch.int32),
+            cu_seqlens_kv_padded=torch.tensor([0, 4, 8], dtype=torch.int32),
+            total_tokens=8,
+        )
+        kwargs = {'packed_seq_params': params}
+
+        MambaLayer._decompose_packed_seq_params_to_cg_kwargs(kwargs, target_len=5)
+        MambaLayer._reconstruct_packed_seq_params_from_cg_kwargs(
+            SimpleNamespace(_cuda_graph_mamba_total_tokens=8), kwargs
+        )
+
+        reconstructed = kwargs['packed_seq_params']
+        assert torch.equal(
+            reconstructed.cu_seqlens_q, torch.tensor([0, 3, 5, 5, 5], dtype=torch.int32)
+        )
+        assert torch.equal(
+            reconstructed.cu_seqlens_q_padded, torch.tensor([0, 4, 8, 8, 8], dtype=torch.int32)
+        )
+        assert reconstructed.seq_idx is params.seq_idx
+
+    def test_mamba_graph_slots_do_not_share_packed_metadata(self):
+        first = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=torch.tensor([0, 3, 8], dtype=torch.int32),
+            cu_seqlens_kv=torch.tensor([0, 3, 8], dtype=torch.int32),
+            cu_seqlens_q_padded=torch.tensor([0, 4, 8], dtype=torch.int32),
+            cu_seqlens_kv_padded=torch.tensor([0, 4, 8], dtype=torch.int32),
+            total_tokens=8,
+        )
+        second = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=torch.tensor([0, 2, 5, 8], dtype=torch.int32),
+            cu_seqlens_kv=torch.tensor([0, 2, 5, 8], dtype=torch.int32),
+            cu_seqlens_q_padded=torch.tensor([0, 2, 6, 8], dtype=torch.int32),
+            cu_seqlens_kv_padded=torch.tensor([0, 2, 6, 8], dtype=torch.int32),
+            total_tokens=8,
+        )
+        first_kwargs = {'packed_seq_params': first}
+        second_kwargs = {'packed_seq_params': second}
+
+        MambaLayer._decompose_packed_seq_params_to_cg_kwargs(first_kwargs, target_len=5)
+        MambaLayer._decompose_packed_seq_params_to_cg_kwargs(second_kwargs, target_len=5)
+
+        for name in ('_mamba_packed_seq_cg_cu_seqlens_q', '_mamba_packed_seq_cg_seq_idx'):
+            assert first_kwargs[name] is not second_kwargs[name]
+        assert torch.equal(
+            first_kwargs['_mamba_packed_seq_cg_cu_seqlens_q'],
+            torch.tensor([0, 3, 8, 8, 8], dtype=torch.int32),
+        )
+        assert torch.equal(
+            second_kwargs['_mamba_packed_seq_cg_cu_seqlens_q'],
+            torch.tensor([0, 2, 5, 8, 8], dtype=torch.int32),
+        )
+
+    @pytest.mark.parametrize(
+        ('seq_idx', 'matches'),
+        [
+            (torch.zeros(1, 8, dtype=torch.int32), True),
+            (torch.zeros(1, 7, dtype=torch.int32), False),
+            (torch.zeros(1, 1, dtype=torch.int32), False),
+            (torch.zeros(1, 8, dtype=torch.int64), False),
+        ],
+    )
+    def test_mamba_cuda_graph_seq_idx_requires_exact_tensor_signature(self, seq_idx, matches):
+        layer = MambaLayer.__new__(MambaLayer)
+        torch.nn.Module.__init__(layer)
+        layer._cuda_graph_mamba_seq_idx_spec = (
+            torch.Size((1, 8)),
+            torch.int32,
+            torch.device('cpu'),
+        )
+
+        assert layer._seq_idx_matches_cuda_graph(seq_idx) is matches
+
+    @pytest.mark.parametrize('pipeline_parallel', [False, True])
+    def test_mamba_cuda_graph_replay_falls_back_for_mismatched_seq_idx(self, pipeline_parallel):
+        layer = MambaLayer.__new__(MambaLayer)
+        torch.nn.Module.__init__(layer)
+        layer._cuda_graph_mamba_seq_idx_spec = (
+            torch.Size((1, 8)),
+            torch.int32,
+            torch.device('cpu'),
+        )
+        layer._use_pp_packed_mamba_cg_inputs = pipeline_parallel
+        eager_calls = []
+
+        def eager_forward(*args, **kwargs):
+            eager_calls.append((args, kwargs))
+            return 'eager-output'
+
+        layer.forward = eager_forward
+        packed_seq_params = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
+            cu_seqlens_kv=torch.tensor([0, 1], dtype=torch.int32),
+            total_tokens=1,
+        )
+
+        output = layer._te_cuda_graph_replay(
+            torch.ones(1, 1, 4), packed_seq_params=packed_seq_params
+        )
+
+        assert output == 'eager-output'
+        assert len(eager_calls) == 1
+        assert eager_calls[0][1]['packed_seq_params'] is packed_seq_params
+
+    def test_core_static_inputs_do_not_require_training_globals(self, monkeypatch):
+        destroy_global_vars()
+        monkeypatch.setattr(
+            GraphableMegatronModule,
+            'get_layer_static_inputs',
+            lambda self, seq_length, micro_batch_size: {
+                'hidden_states': torch.ones(seq_length, micro_batch_size, 4)
+            },
+        )
+        layer = TransformerLayer.__new__(TransformerLayer)
+        torch.nn.Module.__init__(layer)
+        layer.config = SimpleNamespace(
+            context_parallel_size=1, cuda_graph_max_packed_seqs=None, cuda_graph_modules=[]
+        )
+        layer.self_attention = torch.nn.Identity()
+
+        static_inputs = layer.get_layer_static_inputs(seq_length=7, micro_batch_size=1)
+
+        assert static_inputs['attention_mask'].shape == (1, 1, 7, 7)
+
+        packed_layer = TransformerLayer.__new__(TransformerLayer)
+        torch.nn.Module.__init__(packed_layer)
+        packed_layer.config = SimpleNamespace(
+            context_parallel_size=1,
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_max_packed_seqs=7,
+            cuda_graph_modules=[],
+            pipeline_model_parallel_size=1,
+        )
+        packed_layer.self_attention = torch.nn.Identity()
+
+        packed_inputs = packed_layer.get_layer_static_inputs(seq_length=7, micro_batch_size=1)
+
+        assert 'attention_mask' not in packed_inputs
+        assert packed_layer._cuda_graph_psp.cu_seqlens_q.numel() == 8
+
+        mamba_layer = MambaLayer.__new__(MambaLayer)
+        torch.nn.Module.__init__(mamba_layer)
+        mamba_layer.config = SimpleNamespace(
+            context_parallel_size=1,
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_max_packed_seqs=7,
+            pipeline_model_parallel_size=1,
+        )
+        mamba_layer.mixer = SimpleNamespace(cp=SimpleNamespace(cp_size=1))
+
+        mamba_inputs = mamba_layer.get_layer_static_inputs(seq_length=7, micro_batch_size=1)
+
+        assert mamba_inputs['hidden_states'].shape == (7, 1, 4)
+        assert mamba_layer._cuda_graph_psp.seq_idx.shape == (1, 7)
+
     def test_attention_dummy_is_valid_without_changing_generic_dummy_contract(self):
         generic, _ = PackedSeqParams.create_dummy_for_cuda_graph(32, max_seqs=64)
         assert generic.cu_seqlens_q.numel() == 65
@@ -80,10 +299,7 @@ class TestPackedSeqCudaGraphMetadata:
         assert torch.all(generic.cu_seqlens_q[1:] == 32)
 
         attention, _ = PackedSeqParams.create_dummy_for_cuda_graph(
-            32,
-            max_seqs=64,
-            context_parallel_size=2,
-            partition_for_attention=True,
+            32, max_seqs=64, context_parallel_size=2, partition_for_attention=True
         )
         expected = torch.arange(0, 33, 4, dtype=torch.int32, device='cuda')
         assert torch.equal(attention.cu_seqlens_q, expected)
@@ -121,12 +337,10 @@ class TestPackedSeqCudaGraphMetadata:
             reconstructed.cu_seqlens_kv, torch.tensor([0, 3, 5, 5, 5], dtype=torch.int32)
         )
         assert torch.equal(
-            reconstructed.cu_seqlens_q_padded,
-            torch.tensor([0, 4, 8, 8, 8], dtype=torch.int32),
+            reconstructed.cu_seqlens_q_padded, torch.tensor([0, 4, 8, 8, 8], dtype=torch.int32)
         )
         assert torch.equal(
-            reconstructed.cu_seqlens_kv_padded,
-            torch.tensor([0, 4, 8, 8, 8], dtype=torch.int32),
+            reconstructed.cu_seqlens_kv_padded, torch.tensor([0, 4, 8, 8, 8], dtype=torch.int32)
         )
         assert reconstructed.pad_between_seqs is True
         assert reconstructed.max_seqlen_q == 32
@@ -214,6 +428,48 @@ def _validated_cuda_graph_cli_args(monkeypatch, cli_args=None, **overrides):
 
 
 class TestCudaGraphConfigAndArguments:
+    @pytest.mark.parametrize(
+        "packed_flag", ['sft', 'dataloader_inter_document_masking', 'rl_use_sequence_packing']
+    )
+    def test_packed_cuda_graph_capacity_is_translated_to_core_config(
+        self, monkeypatch, packed_flag
+    ):
+        args, _, _ = _validated_cuda_graph_cli_args(
+            monkeypatch, ['--cuda-graph-impl', 'transformer_engine'], **{packed_flag: True}
+        )
+
+        config = core_transformer_config_from_args(args)
+
+        assert config.cuda_graph_max_packed_seqs == 2048
+
+    def test_dense_cuda_graph_does_not_enable_packed_metadata(self, monkeypatch):
+        args, _, _ = _validated_cuda_graph_cli_args(
+            monkeypatch, ['--cuda-graph-impl', 'transformer_engine']
+        )
+
+        config = core_transformer_config_from_args(args)
+
+        assert config.cuda_graph_max_packed_seqs is None
+
+    def test_explicit_packed_cuda_graph_capacity_is_translated_to_core_config(self, monkeypatch):
+        args, _, _ = _validated_cuda_graph_cli_args(
+            monkeypatch,
+            ['--cuda-graph-impl', 'transformer_engine', '--cuda-graph-max-packed-seqs', '37'],
+        )
+
+        config = core_transformer_config_from_args(args)
+
+        assert config.cuda_graph_max_packed_seqs == 37
+
+    def test_nonpositive_packed_cuda_graph_capacity_is_rejected(self, monkeypatch):
+        args, _, _ = _validated_cuda_graph_cli_args(
+            monkeypatch,
+            ['--cuda-graph-impl', 'transformer_engine', '--cuda-graph-max-packed-seqs', '0'],
+        )
+
+        with pytest.raises(AssertionError, match='cuda_graph_max_packed_seqs must be positive'):
+            core_transformer_config_from_args(args)
+
     def test_local_impl_defaults_to_layer_scope(self):
         cfg = _base_cuda_graph_config(cuda_graph_impl='local')
         assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.layer
@@ -651,9 +907,7 @@ class TestPackedSeqCudagraphs:
             pad_between_seqs=True,
         )
 
-    @pytest.mark.parametrize(
-        "cp_size,fixed_capacity_offsets", [(1, False), (2, False), (2, True)]
-    )
+    @pytest.mark.parametrize("cp_size,fixed_capacity_offsets", [(1, False), (2, False), (2, True)])
     def test_thd_capture_with_pad_between_seqs(self, cp_size, fixed_capacity_offsets):
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         Utils.initialize_model_parallel(context_parallel_size=cp_size)
@@ -695,10 +949,7 @@ class TestPackedSeqCudagraphs:
                 context_parallel_size=cp_size,
                 partition_for_attention=True,
             )
-            lengths = (
-                packed_seq_params.cu_seqlens_q[1:]
-                - packed_seq_params.cu_seqlens_q[:-1]
-            )
+            lengths = packed_seq_params.cu_seqlens_q[1:] - packed_seq_params.cu_seqlens_q[:-1]
             assert packed_seq_params.cu_seqlens_q.numel() == 9
             assert torch.all(lengths == 2 * cp_size)
         # Each CP rank holds its 1/cp_size share of the bin's tokens.
@@ -742,18 +993,14 @@ class TestPackedSeqCudagraphs:
         padded_cu_seqlens_metadata = packed_seq_params.cu_seqlens_q_padded.cg_buffer_metadata
         if fixed_capacity_offsets:
             assert (
-                packed_seq_params.cu_seqlens_kv.cg_buffer_metadata
-                is not actual_cu_seqlens_metadata
+                packed_seq_params.cu_seqlens_kv.cg_buffer_metadata is not actual_cu_seqlens_metadata
             )
             assert (
                 packed_seq_params.cu_seqlens_kv_padded.cg_buffer_metadata
                 is not padded_cu_seqlens_metadata
             )
         else:
-            assert (
-                packed_seq_params.cu_seqlens_kv.cg_buffer_metadata
-                is actual_cu_seqlens_metadata
-            )
+            assert packed_seq_params.cu_seqlens_kv.cg_buffer_metadata is actual_cu_seqlens_metadata
             assert (
                 packed_seq_params.cu_seqlens_kv_padded.cg_buffer_metadata
                 is padded_cu_seqlens_metadata
@@ -1255,7 +1502,6 @@ class TestTECudaGraphHelper:
         monkeypatch.setenv("NVTE_FLASH_ATTN", "0")
         monkeypatch.setenv("NVTE_FUSED_ATTN", "1")
         monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
-        set_args(SimpleNamespace(sft=True, cuda_graph_max_packed_seqs=4))
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=pp_size,
@@ -1275,6 +1521,7 @@ class TestTECudaGraphHelper:
             num_attention_heads=4,
             use_cpu_initialization=True,
             cuda_graph_impl="transformer_engine",
+            cuda_graph_max_packed_seqs=4,
             cuda_graph_modules=[CudaGraphModule.attn],
             use_te_rng_tracker=True,
             bf16=True,
@@ -1308,6 +1555,11 @@ class TestTECudaGraphHelper:
         sample_kwargs = graph_kwargs['sample_kwargs']
         assert all('attention_mask' not in kwargs for kwargs in sample_kwargs)
         assert all(kwargs['rotary_pos_emb'].shape[0] == seq_length for kwargs in sample_kwargs)
+        expected_packed_rotary = model[0].rotary_pos_emb(seq_length, packed_seq=True)
+        assert all(
+            torch.equal(kwargs['rotary_pos_emb'], expected_packed_rotary)
+            for kwargs in sample_kwargs
+        )
         if pp_size == 1:
             for layer in helper.flattened_callables:
                 packed_seq_params = layer._cuda_graph_psp
@@ -1317,8 +1569,7 @@ class TestTECudaGraphHelper:
                 assert packed_seq_params.cu_seqlens_kv_padded is not None
                 assert packed_seq_params.pad_between_seqs is True
                 assert torch.all(
-                    packed_seq_params.cu_seqlens_q[1:]
-                    > packed_seq_params.cu_seqlens_q[:-1]
+                    packed_seq_params.cu_seqlens_q[1:] > packed_seq_params.cu_seqlens_q[:-1]
                 )
             replay_kwargs = dict(
                 sample_kwargs[0],
@@ -1345,18 +1596,15 @@ class TestTECudaGraphHelper:
                 )
             replay_kwargs = dict(sample_kwargs[0], attention_mask=None)
 
-        _, normalized_replay_kwargs = helper.flattened_callables[
-            0
-        ]._get_te_cuda_graph_replay_args(*sample_args[0], **replay_kwargs)
+        _, normalized_replay_kwargs = helper.flattened_callables[0]._get_te_cuda_graph_replay_args(
+            *sample_args[0], **replay_kwargs
+        )
         assert 'attention_mask' not in normalized_replay_kwargs
 
     def test_packed_non_attention_scope_does_not_create_attention_graph_inputs(self):
         seq_length = 32
-        set_args(SimpleNamespace(sft=True, cuda_graph_max_packed_seqs=4))
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            context_parallel_size=2,
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=2
         )
 
         config = TransformerConfig(
@@ -1365,6 +1613,7 @@ class TestTECudaGraphHelper:
             num_attention_heads=4,
             use_cpu_initialization=True,
             cuda_graph_impl="transformer_engine",
+            cuda_graph_max_packed_seqs=4,
             cuda_graph_modules=[CudaGraphModule.mlp],
             use_te_rng_tracker=True,
             bf16=True,

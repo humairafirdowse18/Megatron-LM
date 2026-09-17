@@ -1090,6 +1090,14 @@ class TransformerConfig(ModelParallelConfig):
     cuda_graph_modules has no effect when cuda_graph_impl="none" and must be empty when
     cuda_graph_impl="full_iteration"."""
 
+    cuda_graph_max_packed_seqs: Optional[int] = None
+    """Fixed packed-sequence metadata capacity for CUDA graph capture.
+
+    ``None`` means the graph is captured without ``PackedSeqParams``. Packed-sequence callers
+    should set this to the maximum number of sequences that a captured graph should accept;
+    larger runtime batches fall back to eager execution.
+    """
+
     cuda_graph_modules: Union[str, CudaGraphModule, List[str], List[CudaGraphModule]] = "full"
     """Selects training capture coverage within per-layer CUDA graphs (local and
     transformer_engine implementations).
@@ -2784,6 +2792,11 @@ class TransformerConfig(ModelParallelConfig):
             "local",
             "full_iteration",
         ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
+
+        assert self.cuda_graph_max_packed_seqs is None or self.cuda_graph_max_packed_seqs > 0, (
+            "cuda_graph_max_packed_seqs must be positive when packed-sequence CUDA graph "
+            "capture is enabled."
+        )
 
         self.inference_cuda_graph_scope = normalize_inference_cuda_graph_scope(
             self.inference_cuda_graph_scope, self.cuda_graph_impl

@@ -1233,11 +1233,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
 
-        from megatron.core.packed_seq_params import CUDA_GRAPH_MAX_PACKED_SEQS
-        from megatron.training import get_args
-
-        _args = get_args()
-        is_packed_sft = getattr(_args, 'sft', False)
+        is_packed_graph = getattr(self.config, 'cuda_graph_max_packed_seqs', None) is not None
         graphs_attention = not self.config.cuda_graph_modules or (
             CudaGraphModule.attn in self.config.cuda_graph_modules
         )
@@ -1245,12 +1241,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if (
             not isinstance(self.self_attention, IdentityOp)
             and graphs_attention
-            and not is_packed_sft
+            and not is_packed_graph
         ):
             slen_per_cp = seq_length // self.config.context_parallel_size
             static_inputs["attention_mask"] = (
-                ~(torch.tril(torch.ones((slen_per_cp, seq_length))).bool())
-                .to(torch.cuda.current_device())
+                ~(
+                    torch.tril(
+                        torch.ones(
+                            (slen_per_cp, seq_length), device=static_inputs["hidden_states"].device
+                        )
+                    ).bool()
+                )
                 .reshape(1, 1, slen_per_cp, seq_length)
                 .tile(micro_batch_size, 1, 1, 1)
             )
@@ -1258,12 +1259,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Packed metadata is a graph input only when attention itself is captured.
         # With MoE/MLP-only scopes, attention runs eagerly before graph replay and
         # consumes the real PackedSeqParams directly.
-        if is_packed_sft and graphs_attention:
+        if is_packed_graph and graphs_attention:
             self._cuda_graph_uses_packed_attention = True
             self._cuda_graph_seq_length = seq_length
-            _max_seqs = (
-                getattr(_args, 'cuda_graph_max_packed_seqs', None) or CUDA_GRAPH_MAX_PACKED_SEQS
-            )
+            max_seqs = self.config.cuda_graph_max_packed_seqs
+            device = static_inputs["hidden_states"].device
             self._use_pp_packed_attn_cg_inputs = (
                 self.config.cuda_graph_impl == "transformer_engine"
                 and self.config.pipeline_model_parallel_size > 1
@@ -1276,32 +1276,28 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # in-flight microbatch cannot be overwritten by a later microbatch.
                 _, packed_seq_buffers = PackedSeqParams.create_dummy_for_cuda_graph(
                     seq_length,
-                    max_seqs=_max_seqs,
+                    max_seqs=max_seqs,
                     context_parallel_size=self.config.context_parallel_size,
                     partition_for_attention=True,
+                    device=device,
                 )
                 static_inputs[_PACKED_SEQ_CG_CU_SEQLENS_Q] = packed_seq_buffers['cu_seqlens_q']
-                static_inputs[_PACKED_SEQ_CG_CU_SEQLENS_KV] = packed_seq_buffers[
-                    'cu_seqlens_kv'
-                ]
+                static_inputs[_PACKED_SEQ_CG_CU_SEQLENS_KV] = packed_seq_buffers['cu_seqlens_kv']
                 static_inputs[_PACKED_SEQ_CG_CU_SEQLENS_Q_PADDED] = packed_seq_buffers[
                     'cu_seqlens_q_padded'
                 ]
                 static_inputs[_PACKED_SEQ_CG_CU_SEQLENS_KV_PADDED] = packed_seq_buffers[
                     'cu_seqlens_kv_padded'
                 ]
-                self._cuda_graph_packed_seq_target_len = packed_seq_buffers[
-                    'cu_seqlens_q'
-                ].shape[0]
+                self._cuda_graph_packed_seq_target_len = packed_seq_buffers['cu_seqlens_q'].shape[0]
                 return static_inputs
 
             # All TransformerLayer instances with the same config share the SAME dict
             # and SAME underlying tensors. Updating once per micro-batch in
             # _te_cuda_graph_replay propagates to all layers' graphs.
-            device = torch.device('cuda', torch.cuda.current_device())
             shared_bufs = PackedSeqParams.get_or_create_shared_cg_buffers(
                 seq_length,
-                _max_seqs,
+                max_seqs,
                 device,
                 context_parallel_size=self.config.context_parallel_size,
                 partition_for_attention=True,
@@ -1383,9 +1379,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         graph_inputs = [kwargs.pop(name, None) for name in graph_input_names]
         if all(value is None for value in graph_inputs):
             return
-        assert all(value is not None for value in graph_inputs), (
-            "THD CUDA graphs require q, kv, q_padded, and kv_padded cu_seqlens inputs"
-        )
+        assert all(
+            value is not None for value in graph_inputs
+        ), "THD CUDA graphs require q, kv, q_padded, and kv_padded cu_seqlens inputs"
 
         kwargs['packed_seq_params'] = PackedSeqParams(
             qkv_format="thd",
@@ -1707,9 +1703,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
     def _get_te_cuda_graph_replay_args(self, *args, **kwargs):
         """Helper function to get tensor arguments for TE CUDA graph."""
-        is_packed_cuda_graph = isinstance(
-            kwargs.get('packed_seq_params'), PackedSeqParams
-        ) or any(
+        is_packed_cuda_graph = isinstance(kwargs.get('packed_seq_params'), PackedSeqParams) or any(
             name in kwargs
             for name in (
                 _PACKED_SEQ_CG_CU_SEQLENS_Q,
