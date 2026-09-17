@@ -8,7 +8,6 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-
 # Maximum number of packed sequences supported by CUDA graph capture.
 # cu_seqlens tensors are padded to this length + 1 for fixed-shape graph inputs.
 # Override at runtime with --cuda-graph-max-packed-seqs.
@@ -67,16 +66,13 @@ class PackedSeqParams:
         if self.seq_idx is not None:
             return  # Already set (e.g. CG dummy PSP with pre-allocated buffer)
 
-        cu_seqlens = self.cu_seqlens_q
+        # Mamba consumes tokens in physical THD storage order.  Valid-token
+        # offsets can differ from physical offsets when sequences are padded,
+        # so sequence IDs must be derived from the padded offsets when present.
+        cu_seqlens = (
+            self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
+        )
         if isinstance(cu_seqlens, Tensor) and self.total_tokens is not None:
-            # Skip seq_idx computation when cu_seqlens has been CG-padded.
-            # CG-padded cu_seqlens contain entries at the global seq_len
-            # (e.g. 262144) while total_tokens is CP-local (e.g. 8192).
-            # In CG mode, seq_idx is managed separately by mamba_layer.py's
-            # _te_cuda_graph_replay via shared CG buffers.
-            if cu_seqlens[-1] > self.total_tokens:
-                return  # CG-padded: skip, let mamba_layer handle seq_idx
-
             total_tokens_tensor = torch.tensor(
                 [self.total_tokens], dtype=cu_seqlens.dtype, device=cu_seqlens.device
             )
@@ -85,7 +81,9 @@ class PackedSeqParams:
             # Example: [5, 2, 4, 5] -> [0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3]
             self.seq_idx = (
                 torch.repeat_interleave(
-                    torch.arange(seq_lengths.numel(), device=cu_seqlens.device), seq_lengths, output_size=self.total_tokens
+                    torch.arange(seq_lengths.numel(), device=cu_seqlens.device),
+                    seq_lengths,
+                    output_size=self.total_tokens,
                 )
                 .to(torch.int32)
                 .unsqueeze(0)  # Add a batch dimension
@@ -104,8 +102,13 @@ class PackedSeqParams:
         replays it for all batches that fit within the bucket.
         """
         actual_len = cu_seqlens.shape[0]
-        if actual_len >= target_len:
-            return cu_seqlens[:target_len]
+        if actual_len > target_len:
+            raise ValueError(
+                f"Packed sequence metadata has {actual_len - 1} sequences, exceeding "
+                f"the CUDA graph capacity of {target_len - 1}."
+            )
+        if actual_len == target_len:
+            return cu_seqlens
         padded = cu_seqlens.new_empty(target_len)
         padded[:actual_len] = cu_seqlens
         padded[actual_len:] = cu_seqlens[-1]
@@ -129,9 +132,7 @@ class PackedSeqParams:
         # to the valid-token offsets; materialize that aliasing before capture
         # or replay instead of representing it with a graph-unsafe None.
         cu_seqlens_q_padded = (
-            self.cu_seqlens_q_padded
-            if self.cu_seqlens_q_padded is not None
-            else self.cu_seqlens_q
+            self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
         )
         cu_seqlens_kv_padded = (
             self.cu_seqlens_kv_padded
@@ -139,9 +140,7 @@ class PackedSeqParams:
             else self.cu_seqlens_kv
         )
         self._cg_padded_qp = PackedSeqParams.pad_cu_seqlens(cu_seqlens_q_padded, target_len)
-        self._cg_padded_kvp = PackedSeqParams.pad_cu_seqlens(
-            cu_seqlens_kv_padded, target_len
-        )
+        self._cg_padded_kvp = PackedSeqParams.pad_cu_seqlens(cu_seqlens_kv_padded, target_len)
 
     # ----------------------------------------------------------------
     # Shared CUDA graph buffer management
@@ -171,7 +170,8 @@ class PackedSeqParams:
             max_seqs,
             context_parallel_size,
             partition_for_attention,
-            int(device.index or 0),
+            device.type,
+            device.index,
         )
         if key not in _CG_SHARED_BUFFERS:
             _, buffers = cls.create_dummy_for_cuda_graph(
@@ -179,6 +179,7 @@ class PackedSeqParams:
                 max_seqs=max_seqs,
                 context_parallel_size=context_parallel_size,
                 partition_for_attention=partition_for_attention,
+                device=device,
             )
             # Object-identity gate; None forces first update.
             buffers['_last_updated_psp'] = None
@@ -186,15 +187,11 @@ class PackedSeqParams:
         return _CG_SHARED_BUFFERS[key]
 
     @classmethod
-    def get_or_create_shared_seq_idx_buffer(
-        cls, total_tokens: int, device: torch.device
-    ) -> Tensor:
+    def get_or_create_shared_seq_idx_buffer(cls, total_tokens: int, device: torch.device) -> Tensor:
         """Return the shared seq_idx buffer tensor for Mamba CUDA graph replay."""
-        key = ('seq_idx', total_tokens, int(device.index or 0))
+        key = ('seq_idx', total_tokens, device.type, device.index)
         if key not in _CG_SHARED_BUFFERS:
-            _CG_SHARED_BUFFERS[key] = torch.zeros(
-                1, total_tokens, dtype=torch.int32, device=device
-            )
+            _CG_SHARED_BUFFERS[key] = torch.zeros(1, total_tokens, dtype=torch.int32, device=device)
         return _CG_SHARED_BUFFERS[key]
 
     @classmethod
@@ -204,6 +201,7 @@ class PackedSeqParams:
         max_seqs: int = CUDA_GRAPH_MAX_PACKED_SEQS,
         context_parallel_size: int = 1,
         partition_for_attention: bool = False,
+        device: Optional[torch.device] = None,
     ) -> Tuple[PackedSeqParams, Dict[str, Tensor]]:
         """Create a dummy PackedSeqParams for CUDA graph capture.
 
@@ -213,10 +211,13 @@ class PackedSeqParams:
         assert max_seqs > 0, "CUDA graph packed-sequence capacity must be positive"
         effective_max_seqs = max_seqs
         if partition_for_attention:
-            cp_alignment = 2 * context_parallel_size
+            # Zigzag CP requires each physical sequence to be divisible by
+            # 2*CP.  Without CP there is no two-way partition, so odd token
+            # capacities remain valid.
+            cp_alignment = 1 if context_parallel_size == 1 else 2 * context_parallel_size
             assert seq_length % cp_alignment == 0, (
                 f"Packed CUDA graph sequence length ({seq_length}) must be divisible by "
-                f"2 * context_parallel_size ({cp_alignment})."
+                f"the context-parallel alignment ({cp_alignment})."
             )
             aligned_token_units = seq_length // cp_alignment
             # Every physical THD attention sequence must occupy at least one
@@ -224,7 +225,11 @@ class PackedSeqParams:
             # a real attention batch.
             effective_max_seqs = min(max_seqs, aligned_token_units)
         cu_seqlens_len = effective_max_seqs + 1
-        device = torch.cuda.current_device()
+        device = (
+            torch.device('cuda', torch.cuda.current_device())
+            if device is None
+            else torch.device(device)
+        )
         dtype = torch.int32
 
         if partition_for_attention:
@@ -234,17 +239,12 @@ class PackedSeqParams:
             positive_sequences = effective_max_seqs
             base_units, extra_units = divmod(aligned_token_units, positive_sequences)
             dummy_lengths = torch.full(
-                (positive_sequences,),
-                base_units * cp_alignment,
-                dtype=dtype,
-                device=device,
+                (positive_sequences,), base_units * cp_alignment, dtype=dtype, device=device
             )
             if extra_units:
                 dummy_lengths[:extra_units] += cp_alignment
 
-            cu_seqlens_q = torch.full(
-                (cu_seqlens_len,), seq_length, dtype=dtype, device=device
-            )
+            cu_seqlens_q = torch.full((cu_seqlens_len,), seq_length, dtype=dtype, device=device)
             cu_seqlens_q[0] = 0
             cu_seqlens_q[1 : positive_sequences + 1] = torch.cumsum(dummy_lengths, dim=0)
             cu_seqlens_kv = cu_seqlens_q.clone()

@@ -26,3 +26,6 @@ docs/apidocs
 # Git worktrees
 .worktrees/
 .claude/worktrees/
+
+#tests
+examples/mamba/cg_bench/
