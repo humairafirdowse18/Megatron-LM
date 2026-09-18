@@ -3171,11 +3171,9 @@ class TransformerConfig(ModelParallelConfig):
             "capture is enabled."
         )
         assert (
-            self.cuda_graph_max_packed_seqs is None
-            or self.cuda_graph_impl == "transformer_engine"
+            self.cuda_graph_max_packed_seqs is None or self.cuda_graph_impl == "transformer_engine"
         ), (
-            "cuda_graph_max_packed_seqs currently requires "
-            "cuda_graph_impl='transformer_engine'."
+            "cuda_graph_max_packed_seqs currently requires " "cuda_graph_impl='transformer_engine'."
         )
         graphs_packed_attention = self.cuda_graph_max_packed_seqs is not None and (
             not self.cuda_graph_modules or CudaGraphModule.attn in self.cuda_graph_modules
