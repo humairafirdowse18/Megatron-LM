@@ -92,6 +92,29 @@ class TestPackedSeqCudaGraphMetadata:
             params.seq_idx, torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]], dtype=torch.int32)
         )
 
+    def test_seq_idx_rejects_total_tokens_before_final_physical_boundary(self):
+        with pytest.raises(RuntimeError):
+            PackedSeqParams(
+                qkv_format='thd',
+                cu_seqlens_q=torch.tensor([0, 3, 5], dtype=torch.int32),
+                cu_seqlens_kv=torch.tensor([0, 3, 5], dtype=torch.int32),
+                cu_seqlens_q_padded=torch.tensor([0, 4, 8], dtype=torch.int32),
+                cu_seqlens_kv_padded=torch.tensor([0, 4, 8], dtype=torch.int32),
+                total_tokens=6,
+            )
+
+    def test_seq_idx_assigns_trailing_tokens_after_final_physical_boundary(self):
+        params = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=torch.tensor([0, 3, 5], dtype=torch.int32),
+            cu_seqlens_kv=torch.tensor([0, 3, 5], dtype=torch.int32),
+            total_tokens=8,
+        )
+
+        assert torch.equal(
+            params.seq_idx, torch.tensor([[0, 0, 0, 1, 1, 2, 2, 2]], dtype=torch.int32)
+        )
+
     def test_attention_dummy_allows_odd_capacity_without_context_parallelism(self):
         params, _ = PackedSeqParams.create_dummy_for_cuda_graph(
             15,
@@ -474,6 +497,33 @@ class TestCudaGraphConfigAndArguments:
         with pytest.raises(AssertionError, match='cuda_graph_max_packed_seqs must be positive'):
             core_transformer_config_from_args(args)
 
+    @pytest.mark.parametrize('cuda_graph_impl', ['local', 'full_iteration'])
+    def test_packed_capacity_rejects_unsupported_cuda_graph_impl(self, cuda_graph_impl):
+        with pytest.raises(
+            AssertionError,
+            match="cuda_graph_max_packed_seqs currently requires.*transformer_engine",
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl=cuda_graph_impl,
+                cuda_graph_max_packed_seqs=8,
+                cuda_graph_modules=[],
+            )
+
+    def test_packed_attention_cuda_graph_requires_transformer_engine_2_18(self, monkeypatch):
+        monkeypatch.setattr(
+            'megatron.core.transformer.transformer_config.is_te_min_version', lambda _: False
+        )
+
+        with pytest.raises(
+            AssertionError,
+            match='Packed-sequence attention CUDA graphs require Transformer Engine >= 2.18.0',
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='transformer_engine',
+                cuda_graph_max_packed_seqs=8,
+                cuda_graph_modules=[CudaGraphModule.attn],
+            )
+
     def test_local_impl_defaults_to_layer_scope(self):
         cfg = _base_cuda_graph_config(cuda_graph_impl='local')
         assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.layer
@@ -599,6 +649,77 @@ class TestCudaGraphConfigAndArguments:
         )
         assert args.cuda_graph_impl == 'local'
         assert any("--enable-cuda-graph is deprecated" in msg for msg in print_messages)
+
+    @pytest.mark.parametrize(
+        'cuda_graph_args',
+        [
+            ['--cuda-graph-impl', 'local'],
+            ['--cuda-graph-impl', 'transformer_engine'],
+            ['--cuda-graph-impl', 'full_iteration', '--no-check-for-nan-in-loss-and-grad'],
+            ['--enable-cuda-graph'],
+        ],
+    )
+    def test_hybrid_context_parallel_rejects_cuda_graphs(self, monkeypatch, cuda_graph_args):
+        with pytest.raises(
+            AssertionError, match='Hybrid context parallelism not supported with CUDA Graph'
+        ):
+            _validated_cuda_graph_cli_args(
+                monkeypatch, cuda_graph_args, hybrid_context_parallel=True
+            )
+
+    @pytest.mark.parametrize(
+        'packed_overrides',
+        [
+            {'sft': True},
+            {'dataloader_inter_document_masking': True},
+            {'cuda_graph_max_packed_seqs': 8},
+        ],
+    )
+    def test_packed_cuda_graph_rejects_micro_batch_size_greater_than_one(
+        self, monkeypatch, packed_overrides
+    ):
+        with pytest.raises(
+            AssertionError, match='Packed-sequence CUDA graphs require --micro-batch-size 1'
+        ):
+            _validated_cuda_graph_cli_args(
+                monkeypatch,
+                ['--cuda-graph-impl', 'transformer_engine'],
+                micro_batch_size=2,
+                **packed_overrides,
+            )
+
+    def test_packed_eager_allows_micro_batch_size_greater_than_one(self, monkeypatch):
+        args, _, _ = _validated_cuda_graph_cli_args(
+            monkeypatch, micro_batch_size=2, sft=True
+        )
+
+        assert args.cuda_graph_impl == 'none'
+        assert args.micro_batch_size == 2
+
+    @pytest.mark.parametrize('cuda_graph_impl', ['local', 'full_iteration'])
+    def test_packed_training_rejects_unsupported_cuda_graph_impl(
+        self, monkeypatch, cuda_graph_impl
+    ):
+        cli_args = ['--cuda-graph-impl', cuda_graph_impl]
+        if cuda_graph_impl == 'full_iteration':
+            cli_args.append('--no-check-for-nan-in-loss-and-grad')
+        with pytest.raises(
+            AssertionError,
+            match='Packed-sequence training CUDA graphs currently require',
+        ):
+            _validated_cuda_graph_cli_args(monkeypatch, cli_args, sft=True)
+
+    def test_cuda_graph_rejects_variable_token_sequence_packing_scheduler(self, monkeypatch):
+        with pytest.raises(
+            AssertionError,
+            match='CUDA graphs do not support the variable-token-count sequence packing scheduler',
+        ):
+            _validated_cuda_graph_cli_args(
+                monkeypatch,
+                ['--cuda-graph-impl', 'transformer_engine'],
+                sequence_packing_scheduler='dp_balanced',
+                calculate_per_token_loss=True,
+            )
 
     def test_full_iteration_inference_scope_cli_migrates_to_block_scope(self, monkeypatch):
         args, warning_messages, _ = _validated_cuda_graph_cli_args(
@@ -1596,11 +1717,7 @@ class TestTECudaGraphHelper:
                 assert torch.all(
                     packed_seq_params.cu_seqlens_q[1:] > packed_seq_params.cu_seqlens_q[:-1]
                 )
-            replay_kwargs = dict(
-                sample_kwargs[0],
-                attention_mask=None,
-                packed_seq_params=helper.flattened_callables[0]._cuda_graph_psp,
-            )
+            replay_kwargs = dict(sample_kwargs[0], attention_mask=None)
         else:
             for kwargs in sample_kwargs:
                 offset_inputs = {

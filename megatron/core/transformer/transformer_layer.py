@@ -1510,8 +1510,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 cu_seqlens_kv_padded=shared_bufs['cu_seqlens_kv_padded'],
                 max_seqlen_q=seq_length,
                 max_seqlen_kv=seq_length,
-                max_seqlen_q_tensor=shared_bufs['max_seqlen_q_tensor'],
-                max_seqlen_kv_tensor=shared_bufs['max_seqlen_kv_tensor'],
                 pad_between_seqs=True,
             )
             self._cuda_graph_psp = dummy_psp
@@ -1727,19 +1725,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 bufs['cu_seqlens_kv'].copy_(psp._cg_padded_kv)
                 bufs['cu_seqlens_q_padded'].copy_(psp._cg_padded_qp)
                 bufs['cu_seqlens_kv_padded'].copy_(psp._cg_padded_kvp)
-                if psp.max_seqlen_q_tensor is not None:
-                    bufs['max_seqlen_q_tensor'].copy_(psp.max_seqlen_q_tensor)
-                if psp.max_seqlen_kv_tensor is not None:
-                    bufs['max_seqlen_kv_tensor'].copy_(psp.max_seqlen_kv_tensor)
                 bufs['_last_updated_psp'] = psp
 
-            # Set int constants on dummy PSP (captured as Python constants in graph).
-            self._cuda_graph_psp.max_seqlen_q = self._cuda_graph_seq_length
-            self._cuda_graph_psp.max_seqlen_kv = self._cuda_graph_seq_length
-
-            # Replace real PSP with fixed-size dummy PSP (buffers now updated in-place).
+            # The dummy PSP was injected inside capture and is not part of TE's callable
+            # signature. Its tensor fields already alias the staging buffers updated above.
             kwargs = dict(kwargs)
-            kwargs['packed_seq_params'] = self._cuda_graph_psp
+            kwargs.pop('packed_seq_params')
 
         if psp is not None and (
             getattr(self, '_use_pp_packed_attn_cg_inputs', False)
@@ -1779,21 +1770,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
     def _te_cuda_graph_replay_impl(self, args, kwargs, context):
         """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""
-        # Cannot delegate to super()._te_cuda_graph_replay: the PP=1 packed-sequence path
-        # still passes a dummy PackedSeqParams whose tensor fields alias shared buffers.
-        kwargs_filtered = {
-            k: v
-            for k, v in kwargs.items()
-            if v is None or isinstance(v, torch.Tensor) or isinstance(v, PackedSeqParams)
-        }
-
-        cg_index = getattr(self, 'current_microbatch', 0) % len(self.cuda_graphs)
-        cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(
-            *args, **kwargs_filtered
-        )
-        for hook, hook_args in self.cuda_graph_manual_hooks:
-            hook(*hook_args)
-        cuda_graph_output = list(self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs))
+        cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
 
         # Flush delayed offload groups from previous layers after graph replay.
         # The CPU is idle during the sync between graph replay and a2a comm,
@@ -1897,7 +1874,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
     def _get_te_cuda_graph_replay_args(self, *args, **kwargs):
         """Helper function to get tensor arguments for TE CUDA graph."""
-        is_packed_cuda_graph = isinstance(kwargs.get('packed_seq_params'), PackedSeqParams) or any(
+        is_packed_cuda_graph = getattr(self, '_cuda_graph_uses_packed_attention', False) or any(
             name in kwargs
             for name in (
                 _PACKED_SEQ_CG_CU_SEQLENS_Q,

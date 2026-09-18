@@ -41,11 +41,9 @@ class PackedSeqParams:
     # for this sub-sample and cp_group MUST be None (consumers fall back to
     # their build-time group); cp_group is only bound when local_cp_size > 1.
     # TEDotProductAttention asserts both directions of this contract.
-    # Tensor versions of max_seqlen for CUDA graph buffer updates (avoids int->tensor inside CG).
-    max_seqlen_q_tensor: Tensor = None
-    max_seqlen_kv_tensor: Tensor = None
     local_cp_size: int = None
     cp_group: dist.ProcessGroup = None
+    # When seq_idx is derived, this must not precede the final physical cu_seqlens offset.
     total_tokens: int = None
     # Pre-computed seq_idx for Mamba. When set, mamba_mixer reads it directly,
     # avoiding dynamic allocations that are forbidden inside CUDA graph capture.
@@ -79,6 +77,9 @@ class PackedSeqParams:
             cu_seqlens_with_max = torch.cat([cu_seqlens, total_tokens_tensor])
             seq_lengths = cu_seqlens_with_max[1:] - cu_seqlens_with_max[:-1]
             # Example: [5, 2, 4, 5] -> [0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3]
+            # output_size avoids synchronizing the CUDA repeats tensor with the host. This
+            # requires total_tokens >= the final physical offset. Do not clamp an invalid
+            # negative remainder; that would change the sum and make output_size incorrect.
             self.seq_idx = (
                 torch.repeat_interleave(
                     torch.arange(seq_lengths.numel(), device=cu_seqlens.device),
@@ -124,9 +125,8 @@ class PackedSeqParams:
         """
         if getattr(self, '_cg_pad_target', None) == target_len:
             return  # Already cached for this target_len
-        self._cg_pad_target = target_len
-        self._cg_padded_q = PackedSeqParams.pad_cu_seqlens(self.cu_seqlens_q, target_len)
-        self._cg_padded_kv = PackedSeqParams.pad_cu_seqlens(self.cu_seqlens_kv, target_len)
+        padded_q = PackedSeqParams.pad_cu_seqlens(self.cu_seqlens_q, target_len)
+        padded_kv = PackedSeqParams.pad_cu_seqlens(self.cu_seqlens_kv, target_len)
         # TE's THD CUDA-graph interface needs all four offsets to be tensor
         # inputs. When storage has no gaps, the physical offsets are identical
         # to the valid-token offsets; materialize that aliasing before capture
@@ -139,8 +139,16 @@ class PackedSeqParams:
             if self.cu_seqlens_kv_padded is not None
             else self.cu_seqlens_kv
         )
-        self._cg_padded_qp = PackedSeqParams.pad_cu_seqlens(cu_seqlens_q_padded, target_len)
-        self._cg_padded_kvp = PackedSeqParams.pad_cu_seqlens(cu_seqlens_kv_padded, target_len)
+        padded_qp = PackedSeqParams.pad_cu_seqlens(cu_seqlens_q_padded, target_len)
+        padded_kvp = PackedSeqParams.pad_cu_seqlens(cu_seqlens_kv_padded, target_len)
+
+        # Publish the cache only after all four fields were padded successfully. A failed
+        # capacity check must not leave this object looking cached with missing attributes.
+        self._cg_padded_q = padded_q
+        self._cg_padded_kv = padded_kv
+        self._cg_padded_qp = padded_qp
+        self._cg_padded_kvp = padded_kvp
+        self._cg_pad_target = target_len
 
     # ----------------------------------------------------------------
     # Shared CUDA graph buffer management
@@ -257,9 +265,6 @@ class PackedSeqParams:
             cu_seqlens_kv = cu_seqlens_q.clone()
             cu_seqlens_q_padded = cu_seqlens_q.clone()
             cu_seqlens_kv_padded = cu_seqlens_q.clone()
-        max_seqlen_q_tensor = torch.tensor([seq_length], dtype=dtype, device=device)
-        max_seqlen_kv_tensor = torch.tensor([seq_length], dtype=dtype, device=device)
-
         psp = cls(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens_q,
@@ -268,8 +273,6 @@ class PackedSeqParams:
             cu_seqlens_kv_padded=cu_seqlens_kv_padded,
             max_seqlen_q=seq_length,
             max_seqlen_kv=seq_length,
-            max_seqlen_q_tensor=max_seqlen_q_tensor,
-            max_seqlen_kv_tensor=max_seqlen_kv_tensor,
             # Keep this graph-static. Letting TE infer it with torch.equal()
             # would synchronize CUDA tensors with the CPU during capture.
             pad_between_seqs=True,
@@ -279,7 +282,5 @@ class PackedSeqParams:
             'cu_seqlens_kv': cu_seqlens_kv,
             'cu_seqlens_q_padded': cu_seqlens_q_padded,
             'cu_seqlens_kv_padded': cu_seqlens_kv_padded,
-            'max_seqlen_q_tensor': max_seqlen_q_tensor,
-            'max_seqlen_kv_tensor': max_seqlen_kv_tensor,
         }
         return psp, buffers

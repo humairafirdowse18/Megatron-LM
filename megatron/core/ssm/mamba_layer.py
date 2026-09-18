@@ -350,8 +350,6 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
                     'cu_seqlens_kv_padded',
                 ):
                     buffers[k][1:] = total_tokens
-                buffers['max_seqlen_q_tensor'].fill_(total_tokens)
-                buffers['max_seqlen_kv_tensor'].fill_(total_tokens)
 
             if self._use_pp_packed_mamba_cg_inputs:
                 static_inputs[_MAMBA_PACKED_SEQ_CG_CU_SEQLENS_Q] = buffers['cu_seqlens_q']
@@ -372,8 +370,6 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
                     cu_seqlens_kv_padded=buffers['cu_seqlens_kv_padded'],
                     max_seqlen_q=total_tokens,
                     max_seqlen_kv=total_tokens,
-                    max_seqlen_q_tensor=buffers['max_seqlen_q_tensor'],
-                    max_seqlen_kv_tensor=buffers['max_seqlen_kv_tensor'],
                     total_tokens=total_tokens,
                     seq_idx=seq_idx_buf,
                 )
@@ -484,36 +480,17 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
                 bufs['cu_seqlens_kv_padded'].copy_(
                     psp._cg_padded_kvp if psp._cg_padded_kvp is not None else psp._cg_padded_kv
                 )
-                if psp.max_seqlen_q_tensor is not None:
-                    bufs['max_seqlen_q_tensor'].copy_(psp.max_seqlen_q_tensor)
-                if psp.max_seqlen_kv_tensor is not None:
-                    bufs['max_seqlen_kv_tensor'].copy_(psp.max_seqlen_kv_tensor)
                 # Copy seq_idx into shared buffer (computed by __post_init__).
                 if 'seq_idx' in bufs and psp.seq_idx is not None:
                     bufs['seq_idx'].copy_(psp.seq_idx)
                 bufs['_last_updated_psp'] = psp
 
-            # Set int constants on dummy PSP (captured as Python constants in graph).
-            self._cuda_graph_psp.max_seqlen_q = self._cuda_graph_seq_length
-            self._cuda_graph_psp.max_seqlen_kv = self._cuda_graph_seq_length
-
-            # Replace real PSP with fixed-size dummy PSP.
+            # The dummy PSP was injected inside capture and is not part of TE's callable
+            # signature. Its tensor fields already alias the staging buffers updated above.
             kwargs = dict(kwargs)
-            kwargs['packed_seq_params'] = self._cuda_graph_psp
+            kwargs.pop('packed_seq_params')
 
-        kwargs_filtered = {
-            k: v
-            for k, v in kwargs.items()
-            if v is None or isinstance(v, torch.Tensor) or isinstance(v, PackedSeqParams)
-        }
-
-        cg_index = getattr(self, 'current_microbatch', 0) % len(self.cuda_graphs)
-        cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(
-            *args, **kwargs_filtered
-        )
-        for hook, hook_args in self.cuda_graph_manual_hooks:
-            hook(*hook_args)
-        return self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
+        return super()._te_cuda_graph_replay(*args, **kwargs)
 
     def _should_call_local_cudagraph(self, *args, **kwargs):
         """

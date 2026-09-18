@@ -1173,7 +1173,7 @@ class TransformerConfig(ModelParallelConfig):
     cuda_graph_impl="full_iteration"."""
 
     cuda_graph_max_packed_seqs: Optional[int] = None
-    """Fixed packed-sequence metadata capacity for CUDA graph capture.
+    """Fixed packed-sequence metadata capacity for Transformer Engine CUDA graph capture.
 
     ``None`` means the graph is captured without ``PackedSeqParams``. Packed-sequence callers
     should set this to the maximum number of sequences that a captured graph should accept;
@@ -3169,6 +3169,20 @@ class TransformerConfig(ModelParallelConfig):
         assert self.cuda_graph_max_packed_seqs is None or self.cuda_graph_max_packed_seqs > 0, (
             "cuda_graph_max_packed_seqs must be positive when packed-sequence CUDA graph "
             "capture is enabled."
+        )
+        assert (
+            self.cuda_graph_max_packed_seqs is None
+            or self.cuda_graph_impl == "transformer_engine"
+        ), (
+            "cuda_graph_max_packed_seqs currently requires "
+            "cuda_graph_impl='transformer_engine'."
+        )
+        graphs_packed_attention = self.cuda_graph_max_packed_seqs is not None and (
+            not self.cuda_graph_modules or CudaGraphModule.attn in self.cuda_graph_modules
+        )
+        assert not graphs_packed_attention or is_te_min_version("2.18.0"), (
+            "Packed-sequence attention CUDA graphs require Transformer Engine >= 2.18.0 "
+            "for capture-safe THD context-parallel backward."
         )
 
         self.inference_cuda_graph_scope = normalize_inference_cuda_graph_scope(

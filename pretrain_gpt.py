@@ -350,27 +350,32 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 physical_cu_seqlens = (
                     cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
                 )
+                uses_cuda_graph = getattr(args, 'cuda_graph_impl', 'none') != 'none'
+                # Preserve the established eager path, which feeds physical offsets to TE.
+                # CUDA graphs need logical and physical offsets as separate fixed-shape inputs.
+                qkv_cu_seqlens = cu_seqlens if uses_cuda_graph else physical_cu_seqlens
+                padded_cu_seqlens_for_params = (
+                    physical_cu_seqlens if uses_cuda_graph else cu_seqlens_padded
+                )
                 # CUDA graphs capture max_seqlen as a Python constant. Keep it static in
                 # graph mode; eager execution retains the per-microbatch value.
                 max_seqlen_for_params = (
-                    args.seq_length
-                    if getattr(args, 'cuda_graph_impl', 'none') != 'none'
-                    else int(max_seqlen.item())
+                    args.seq_length if uses_cuda_graph else int(max_seqlen.item())
                 )
                 packed_seq_params = PackedSeqParams(
                     qkv_format="thd",
                     # TE needs both logical token boundaries and physical padded slots.
-                    cu_seqlens_q=cu_seqlens,
-                    cu_seqlens_kv=cu_seqlens,
-                    cu_seqlens_q_padded=physical_cu_seqlens,
-                    cu_seqlens_kv_padded=physical_cu_seqlens,
+                    cu_seqlens_q=qkv_cu_seqlens,
+                    cu_seqlens_kv=qkv_cu_seqlens,
+                    cu_seqlens_q_padded=padded_cu_seqlens_for_params,
+                    cu_seqlens_kv_padded=padded_cu_seqlens_for_params,
                     max_seqlen_q=max_seqlen_for_params,
                     max_seqlen_kv=max_seqlen_for_params,
                     local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
                     cp_group=hybrid_cp_group,
                     tokens_per_sample=args.seq_length,
                     # Keep eager warmup, capture, and replay on the same TE THD branch.
-                    pad_between_seqs=True,
+                    pad_between_seqs=True if uses_cuda_graph else None,
                 )
 
     timers('batch-generator').stop()
