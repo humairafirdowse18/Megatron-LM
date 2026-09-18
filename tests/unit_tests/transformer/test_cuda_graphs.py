@@ -77,6 +77,17 @@ from tests.unit_tests.test_utilities import (
 fp8_available, _ = check_fp8_support()
 
 
+class _CudaGraphDecoderModel(torch.nn.Module):
+    """Minimal model wrapper accepted by ``TECudaGraphHelper``."""
+
+    def __init__(self, decoder: torch.nn.Module) -> None:
+        super().__init__()
+        self.decoder = decoder
+
+    def zero_grad_buffer(self) -> None:
+        self.zero_grad(set_to_none=True)
+
+
 class TestPackedSeqCudaGraphMetadata:
     def test_seq_idx_uses_physical_padded_boundaries(self):
         params = PackedSeqParams(
@@ -504,9 +515,7 @@ class TestCudaGraphConfigAndArguments:
             match="cuda_graph_max_packed_seqs currently requires.*transformer_engine",
         ):
             _base_cuda_graph_config(
-                cuda_graph_impl=cuda_graph_impl,
-                cuda_graph_max_packed_seqs=8,
-                cuda_graph_modules=[],
+                cuda_graph_impl=cuda_graph_impl, cuda_graph_max_packed_seqs=8, cuda_graph_modules=[]
             )
 
     def test_packed_attention_cuda_graph_requires_transformer_engine_2_18(self, monkeypatch):
@@ -689,9 +698,7 @@ class TestCudaGraphConfigAndArguments:
             )
 
     def test_packed_eager_allows_micro_batch_size_greater_than_one(self, monkeypatch):
-        args, _, _ = _validated_cuda_graph_cli_args(
-            monkeypatch, micro_batch_size=2, sft=True
-        )
+        args, _, _ = _validated_cuda_graph_cli_args(monkeypatch, micro_batch_size=2, sft=True)
 
         assert args.cuda_graph_impl == 'none'
         assert args.micro_batch_size == 2
@@ -704,8 +711,7 @@ class TestCudaGraphConfigAndArguments:
         if cuda_graph_impl == 'full_iteration':
             cli_args.append('--no-check-for-nan-in-loss-and-grad')
         with pytest.raises(
-            AssertionError,
-            match='Packed-sequence training CUDA graphs currently require',
+            AssertionError, match='Packed-sequence training CUDA graphs currently require'
         ):
             _validated_cuda_graph_cli_args(monkeypatch, cli_args, sft=True)
 
@@ -1053,6 +1059,7 @@ class TestPackedSeqCudagraphs:
             pad_between_seqs=True,
         )
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.parametrize("cp_size,fixed_capacity_offsets", [(1, False), (2, False), (2, True)])
     def test_thd_capture_with_pad_between_seqs(self, cp_size, fixed_capacity_offsets):
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
@@ -1639,6 +1646,7 @@ class TestTECudaGraphHelper:
         # Note: _unique_buffer_counts is intentionally NOT cleared here so we can
         # compare values across parametrized test runs
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.parametrize("pp_size", [1, 2])
     def test_packed_attn_static_inputs_preserve_four_offsets(self, pp_size, monkeypatch):
         cp_size = 2
@@ -1736,12 +1744,335 @@ class TestTECudaGraphHelper:
                     offset_inputs['_packed_seq_cg_cu_seqlens_q'][1:]
                     > offset_inputs['_packed_seq_cg_cu_seqlens_q'][:-1]
                 )
+            offset_names = {
+                '_packed_seq_cg_cu_seqlens_q',
+                '_packed_seq_cg_cu_seqlens_kv',
+                '_packed_seq_cg_cu_seqlens_q_padded',
+                '_packed_seq_cg_cu_seqlens_kv_padded',
+            }
+            # Stage zero has F0,F1 before B0 and therefore needs two metadata slots. The last
+            # stage runs F0,B0,F1,B1, so TE may safely reuse the first slot for F1.
+            expect_shared = helper.pp_group.rank() == pp_size - 1
+            for name in offset_names:
+                assert (sample_kwargs[0][name] is sample_kwargs[1][name]) is expect_shared
             replay_kwargs = dict(sample_kwargs[0], attention_mask=None)
 
         _, normalized_replay_kwargs = helper.flattened_callables[0]._get_te_cuda_graph_replay_args(
             *sample_args[0], **replay_kwargs
         )
         assert 'attention_mask' not in normalized_replay_kwargs
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.18.0")),
+        reason="Packed attention CUDA graphs require TransformerEngine >= 2.18.0",
+    )
+    def test_packed_attn_te_capture_replay_pp2_preserves_microbatch_offsets(self, monkeypatch):
+        """Replay two in-flight PP microbatches with distinct packed boundaries."""
+        pp_size = 2
+        cp_size = 2
+        num_microbatches = 2
+        seq_length = 32
+        micro_batch_size = 1
+        monkeypatch.setenv("NVTE_FLASH_ATTN", "0")
+        monkeypatch.setenv("NVTE_FUSED_ATTN", "1")
+        monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=pp_size,
+            context_parallel_size=cp_size,
+        )
+        init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=micro_batch_size * num_microbatches,
+            micro_batch_size=micro_batch_size,
+            data_parallel_size=1,
+            decrease_batch_size_if_needed=False,
+        )
+        model_parallel_cuda_manual_seed(123)
+
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_max_packed_seqs=4,
+            cuda_graph_modules=[CudaGraphModule.attn],
+            cuda_graph_warmup_steps=1,
+            use_te_rng_tracker=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            pipeline_model_parallel_size=pp_size,
+            context_parallel_size=cp_size,
+            attention_backend=AttnBackend.fused,
+            deterministic_mode=True,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        model_chunk = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=128,
+            max_sequence_length=seq_length,
+            parallel_output=True,
+            position_embedding_type="rope",
+        ).cuda()
+        # TECudaGraphHelper normally receives a DDP wrapper. This focused layer test does not
+        # need DDP, but the helper still requires the same gradient-reset interface.
+        model_chunk.zero_grad_buffer = model_chunk.zero_grad
+        model = [model_chunk]
+        helper = TECudaGraphHelper(
+            model=model,
+            config=config,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            optimizers=[],
+        )
+        layer = helper.flattened_callables[0]
+        rotary_pos_emb = model_chunk.rotary_pos_emb(seq_length, packed_seq=True)
+
+        def make_packed_params(boundaries):
+            offsets = torch.tensor(boundaries, dtype=torch.int32, device='cuda')
+            return PackedSeqParams(
+                qkv_format='thd',
+                cu_seqlens_q=offsets,
+                cu_seqlens_kv=offsets.clone(),
+                cu_seqlens_q_padded=offsets.clone(),
+                cu_seqlens_kv_padded=offsets.clone(),
+                max_seqlen_q=seq_length,
+                max_seqlen_kv=seq_length,
+                pad_between_seqs=True,
+            )
+
+        packed_params = [
+            make_packed_params([0, 8, 16, 24, 32]),
+            make_packed_params([0, 4, 12, 20, 32]),
+        ]
+        base_inputs = [
+            torch.randn(
+                seq_length // cp_size,
+                micro_batch_size,
+                config.hidden_size,
+                dtype=torch.bfloat16,
+                device='cuda',
+            )
+            for _ in range(num_microbatches)
+        ]
+
+        eager_outputs = []
+        for microbatch_id in range(num_microbatches):
+            eager_hidden = base_inputs[microbatch_id].detach().clone().requires_grad_(True)
+            eager_output, _ = layer(
+                hidden_states=eager_hidden,
+                attention_mask=None,
+                rotary_pos_emb=rotary_pos_emb,
+                packed_seq_params=packed_params[microbatch_id],
+            )
+            eager_outputs.append(eager_output.detach().clone())
+        del eager_hidden, eager_output
+        model_chunk.zero_grad(set_to_none=True)
+
+        try:
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+            assert len(layer.cuda_graphs) == num_microbatches
+
+            replay_inputs = []
+            replay_outputs = []
+
+            def replay_forward(microbatch_id):
+                set_current_microbatch(model_chunk, microbatch_id)
+                hidden_states = base_inputs[microbatch_id].detach().clone().requires_grad_(True)
+                output, _ = layer(
+                    hidden_states=hidden_states,
+                    attention_mask=None,
+                    rotary_pos_emb=rotary_pos_emb,
+                    packed_seq_params=packed_params[microbatch_id],
+                )
+                torch.testing.assert_close(output, eager_outputs[microbatch_id])
+                replay_inputs.append(hidden_states)
+                replay_outputs.append(output)
+
+            # Match the non-interleaved 1F1B ordering used to create TE's graphs. Stage zero
+            # has two forward activations alive before its first backward; the last stage does
+            # one forward/backward pair at a time.
+            if helper.pp_group.rank() == 0:
+                replay_forward(0)
+                replay_forward(1)
+                replay_outputs[0].float().sum().backward()
+                replay_outputs[1].float().sum().backward()
+            else:
+                replay_forward(0)
+                replay_outputs[0].float().sum().backward()
+                replay_forward(1)
+                replay_outputs[1].float().sum().backward()
+
+            assert all(hidden_states.grad is not None for hidden_states in replay_inputs)
+            assert all(torch.isfinite(hidden_states.grad).all() for hidden_states in replay_inputs)
+            torch.cuda.synchronize()
+            del replay_outputs
+        finally:
+            if helper.graphs_created():
+                helper.delete_cuda_graphs()
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.10.0")),
+        reason="Packed Mamba CUDA graph tensor inputs require TransformerEngine >= 1.10.0",
+    )
+    def test_packed_mamba_te_capture_replay_pp2_follows_schedule_lifetimes(self, monkeypatch):
+        """Mamba metadata buffers stay live through TE PP capture, replay, and backward."""
+        pp_size = 2
+        num_microbatches = 2
+        seq_length = 32
+        micro_batch_size = 1
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=pp_size,
+            context_parallel_size=1,
+        )
+        init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=micro_batch_size * num_microbatches,
+            micro_batch_size=micro_batch_size,
+            data_parallel_size=1,
+            decrease_batch_size_if_needed=False,
+        )
+        model_parallel_cuda_manual_seed(123)
+
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_max_packed_seqs=4,
+            cuda_graph_modules=[CudaGraphModule.mamba],
+            use_te_rng_tracker=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            pipeline_model_parallel_size=pp_size,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        decoder = HybridStack(
+            config,
+            hybrid_stack_spec.submodules,
+            layer_config_list=validate_segment_layers("M", config),
+            pp_layer_offset=pg_collection.pp.rank(),
+            pg_collection=pg_collection,
+        ).cuda()
+        model = [_CudaGraphDecoderModel(decoder)]
+        helper = TECudaGraphHelper(
+            model=model,
+            config=config,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            optimizers=[],
+            pg_collection=pg_collection,
+        )
+
+        _, graph_kwargs = helper._get_cuda_graph_input_data()
+        sample_kwargs = graph_kwargs['sample_kwargs']
+        assert len(sample_kwargs) == num_microbatches
+        metadata_names = {
+            '_mamba_packed_seq_cg_cu_seqlens_q',
+            '_mamba_packed_seq_cg_cu_seqlens_kv',
+            '_mamba_packed_seq_cg_cu_seqlens_q_padded',
+            '_mamba_packed_seq_cg_cu_seqlens_kv_padded',
+            '_mamba_packed_seq_cg_seq_idx',
+        }
+        assert metadata_names.issubset(sample_kwargs[0])
+        assert metadata_names.issubset(sample_kwargs[1])
+        assert all(torch.is_tensor(sample_kwargs[0][name]) for name in metadata_names)
+
+        # PP rank zero has F0,F1 before B0, so its metadata must occupy two graph slots.
+        # The last stage runs F0,B0,F1,B1 and may safely reuse the first slot for F1.
+        expect_shared = pg_collection.pp.rank() == pp_size - 1
+        for name in metadata_names:
+            assert (sample_kwargs[0][name] is sample_kwargs[1][name]) is expect_shared
+
+        layer = helper.flattened_callables[0]
+
+        def make_packed_params(boundaries):
+            offsets = torch.tensor(boundaries, dtype=torch.int32, device='cuda')
+            return PackedSeqParams(
+                qkv_format='thd',
+                cu_seqlens_q=offsets,
+                cu_seqlens_kv=offsets.clone(),
+                cu_seqlens_q_padded=offsets.clone(),
+                cu_seqlens_kv_padded=offsets.clone(),
+                max_seqlen_q=seq_length,
+                max_seqlen_kv=seq_length,
+                total_tokens=seq_length,
+                pad_between_seqs=True,
+            )
+
+        packed_params = [make_packed_params([0, 8, 32]), make_packed_params([0, 16, 24, 32])]
+        base_inputs = [
+            torch.randn(
+                seq_length,
+                micro_batch_size,
+                config.hidden_size,
+                dtype=torch.bfloat16,
+                device='cuda',
+            )
+            for _ in range(num_microbatches)
+        ]
+
+        eager_outputs = []
+        for microbatch_id in range(num_microbatches):
+            eager_hidden = base_inputs[microbatch_id].detach().clone().requires_grad_(True)
+            eager_output = layer(
+                hidden_states=eager_hidden, packed_seq_params=packed_params[microbatch_id]
+            )
+            eager_outputs.append(eager_output.detach().clone())
+        del eager_hidden, eager_output
+        model[0].zero_grad_buffer()
+
+        try:
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+            assert len(layer.cuda_graphs) == num_microbatches
+
+            replay_inputs = []
+            replay_outputs = []
+
+            def replay_forward(microbatch_id):
+                set_current_microbatch(model[0], microbatch_id)
+                hidden_states = base_inputs[microbatch_id].detach().clone().requires_grad_(True)
+                output = layer(
+                    hidden_states=hidden_states, packed_seq_params=packed_params[microbatch_id]
+                )
+                torch.testing.assert_close(output, eager_outputs[microbatch_id])
+                replay_inputs.append(hidden_states)
+                replay_outputs.append(output)
+
+            if pg_collection.pp.rank() == 0:
+                replay_forward(0)
+                replay_forward(1)
+                replay_outputs[0].float().sum().backward()
+                replay_outputs[1].float().sum().backward()
+            else:
+                replay_forward(0)
+                replay_outputs[0].float().sum().backward()
+                replay_forward(1)
+                replay_outputs[1].float().sum().backward()
+
+            assert all(hidden_states.grad is not None for hidden_states in replay_inputs)
+            assert all(torch.isfinite(hidden_states.grad).all() for hidden_states in replay_inputs)
+            torch.cuda.synchronize()
+            del replay_outputs
+        finally:
+            if helper.graphs_created():
+                helper.delete_cuda_graphs()
 
     def test_packed_non_attention_scope_does_not_create_attention_graph_inputs(self):
         seq_length = 32
